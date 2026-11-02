@@ -213,7 +213,6 @@ async function ensureDeviceRegistered(signal) {
     }
 
     /* BƯỚC 1: CHECK - chỉ gửi deviceId */
-
     const check = await callWorker("/check");
 
     if (check.code === "DEVICE_LOCKED") {
@@ -244,7 +243,6 @@ async function ensureDeviceRegistered(signal) {
     ].includes(check.code);
 
     /* BƯỚC 2: RENEW */
-
     if (checkSuccess || deviceExpired) {
         const renew = await callWorker("/renew");
 
@@ -256,7 +254,6 @@ async function ensureDeviceRegistered(signal) {
         }
 
         const notExpired = renew.code === "DEVICE_NOT_EXPIRED";
-
         const renewSuccess =
             renew.response.ok &&
             renew.data?.success === true;
@@ -277,7 +274,6 @@ async function ensureDeviceRegistered(signal) {
     }
 
     /* BƯỚC 3: REGISTER */
-
     if (deviceNotRegistered) {
         const registration = await callWorker("/register");
 
@@ -498,11 +494,9 @@ async function loadQuizzes(showToast = false) {
         }, CONFIG.API_TIMEOUT);
 
         /* BƯỚC 1: CHECK -> RENEW hoặc REGISTER */
-
         await ensureDeviceRegistered(controller.signal);
 
         /* BƯỚC 2: Đọc lại thông tin thiết bị */
-
         const credentials = getDeviceCredentials();
 
         const deviceId = String(
@@ -521,7 +515,6 @@ async function loadQuizzes(showToast = false) {
         }
 
         /* BƯỚC 3: Gọi /list */
-
         const requestUrl = new URL(
             CONFIG.API_URL,
             window.location.origin
@@ -610,9 +603,7 @@ async function loadQuizzes(showToast = false) {
         }
 
         /* BƯỚC 4: Chuẩn hóa dữ liệu */
-
         const rawQuizzes = normalizeApiData(result);
-
         state.quizzes = normalizeQuizzes(rawQuizzes);
 
         filterAndRender();
@@ -626,7 +617,6 @@ async function loadQuizzes(showToast = false) {
                 "Đã cập nhật dữ liệu phiên Quiz."
             );
         }
-
     } catch (error) {
         console.error("QUIZ API ERROR:", error);
 
@@ -639,7 +629,6 @@ async function loadQuizzes(showToast = false) {
 
         updateCount();
         showError(getErrorMessage(error));
-
     } finally {
         if (timeout !== null) {
             clearTimeout(timeout);
@@ -650,7 +639,6 @@ async function loadQuizzes(showToast = false) {
         setRefreshLoading(false);
     }
 }
-
 /* ===================== NORMALIZE API DATA ================ */
 
 function normalizeApiData(result) {
@@ -710,6 +698,24 @@ function normalizeQuizzes(quizzes) {
             return;
         }
 
+        const quizEndTime =
+            item.endTime ??
+            item.end_time ??
+            item.end ??
+            "";
+
+        // Ẩn phiên Quiz đã hết hạn từ 7 ngày trở lên,
+        // kể cả khi API vẫn tiếp tục trả về phiên đó.
+        const quizEndTimestamp = parseQuizTime(quizEndTime);
+        const QUIZ_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+        if (
+            quizEndTimestamp !== null &&
+            Date.now() - quizEndTimestamp >= QUIZ_RETENTION_MS
+        ) {
+            return;
+        }
+
         usedCodes.add(code);
 
         normalized.push({
@@ -745,6 +751,7 @@ function normalizeQuizzes(quizzes) {
 
     return normalized;
 }
+
 /* ====================== QUIZ STATUS ====================== */
 
 /* ====================== QUIZ ALERT PHASE ====================== */
@@ -782,6 +789,8 @@ function getQuizAlertPhase(quiz, now = Date.now()) {
 
     return "";
 }
+
+/* ====================== ALERT STYLES ====================== */
 
 function injectQuizAlertStyles() {
     if (document.getElementById("quizAlertAnimationStyles")) {
@@ -835,6 +844,8 @@ function injectQuizAlertStyles() {
     document.head.appendChild(style);
 }
 
+/* ====================== GET QUIZ STATUS ====================== */
+
 function getQuizStatus(quiz) {
     const now = Date.now();
 
@@ -862,7 +873,6 @@ function getQuizStatus(quiz) {
     }
 
     /*
-     * QUAN TRỌNG:
      * Khi thời gian hiện tại bằng hoặc lớn hơn endTime,
      * phiên Quiz lập tức được xem là đã đóng.
      * Không phụ thuộc active hoặc status từ API.
@@ -993,26 +1003,39 @@ function formatCountdown(milliseconds) {
 
 function filterAndRender() {
     const keyword = state.searchText;
+    const now = Date.now();
+    const QUIZ_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
-    if (!keyword) {
-        state.filteredQuizzes = state.quizzes.slice();
-    } else {
-        state.filteredQuizzes = state.quizzes.filter(function(quiz) {
-            const text = [
-                quiz.name,
-                quiz.code,
-                quiz.description
-            ].join(" ").toLowerCase();
+    /*
+     * Lọc lại theo thời gian mỗi lần render.
+     * Phiên Quiz sẽ tự biến mất sau khi hết hạn đủ 7 ngày,
+     * kể cả khi API vẫn trả về phiên đó hoặc trang không tải lại API.
+     */
 
-            return text.includes(keyword);
-        });
-    }
+    const visibleQuizzes = state.quizzes.filter(function(quiz) {
+        const endTimestamp = parseQuizTime(quiz.endTime);
 
-    /* Sắp xếp theo thời hạn trước khi hiển thị */
+        if (
+            endTimestamp !== null &&
+            now - endTimestamp >= QUIZ_RETENTION_MS
+        ) {
+            return false;
+        }
 
-    state.filteredQuizzes = sortQuizzesByDeadline(
-        state.filteredQuizzes
-    );
+        if (!keyword) {
+            return true;
+        }
+
+        const text = [
+            quiz.name,
+            quiz.code,
+            quiz.description
+        ].join(" ").toLowerCase();
+
+        return text.includes(keyword);
+    });
+
+    state.filteredQuizzes = sortQuizzesByDeadline(visibleQuizzes);
 
     renderQuizzes();
     updateCount();
@@ -1111,7 +1134,6 @@ function renderQuizzes() {
     });
 
     elements.quizContainer.appendChild(fragment);
-
     applyViewMode();
 }
 /* ======================== CREATE CARD ==================== */
@@ -1143,10 +1165,8 @@ function createQuizCard(quiz) {
         '<i class="fa-solid fa-graduation-cap"></i>';
 
     const statusBadge = document.createElement("span");
-
     statusBadge.className =
         "quiz-status status-" + status.type;
-
     statusBadge.textContent = status.text;
 
     top.appendChild(icon);
@@ -1204,7 +1224,6 @@ function createQuizCard(quiz) {
     footer.className = "quiz-card-footer";
 
     const playButton = document.createElement("button");
-
     playButton.type = "button";
     playButton.className = "play-button";
 
@@ -1441,6 +1460,7 @@ function hideEmpty() {
         elements.emptyState.classList.add("hidden");
     }
 }
+
 /* ============================== ERROR =================== */
 
 function showError(message) {
@@ -1626,6 +1646,7 @@ function handleKeyboard(event) {
  * - Cập nhật trạng thái mở/đóng của từng Quiz.
  * - Tự động sắp xếp lại theo thời hạn.
  * - Khóa nút chơi khi phiên Quiz đã hết giờ.
+ * - Ẩn phiên Quiz đã hết hạn đủ 7 ngày.
  */
 
 setInterval(function() {
