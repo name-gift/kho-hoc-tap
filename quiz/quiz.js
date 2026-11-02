@@ -1,9 +1,10 @@
 "use strict";
 
 /* ======================== CONFIG ======================== */
+
 const CONFIG = {
-    API_BASE: "/quiz/api",
-    API_URL: "/quiz/api/list",
+    API_BASE: "https://api-quiz.abcd1601ab.workers.dev",
+    API_URL: "https://api-quiz.abcd1601ab.workers.dev/list",
     API_TIMEOUT: 20000,
     STORAGE_VIEW: "quiz_view_mode_v1",
     STORAGE_DEVICE_ID: "kho_tai_lieu_device_id_v1",
@@ -11,6 +12,7 @@ const CONFIG = {
 };
 
 /* ======================== STATE ========================= */
+
 const state = {
     quizzes: [],
     filteredQuizzes: [],
@@ -105,7 +107,7 @@ async function ensureDeviceRegistered(signal) {
     async function callWorker(path, params = {}) {
         const url = new URL(
             String(path).replace(/^\/+/, ""),
-            apiBase.toString().replace(/\/$/, "") + "/"
+            apiBase.toString().replace(/\/+$/, "") + "/"
         );
 
         url.searchParams.set("deviceId", deviceId);
@@ -211,6 +213,7 @@ async function ensureDeviceRegistered(signal) {
     }
 
     /* BƯỚC 1: CHECK - chỉ gửi deviceId */
+
     const check = await callWorker("/check");
 
     if (check.code === "DEVICE_LOCKED") {
@@ -241,6 +244,7 @@ async function ensureDeviceRegistered(signal) {
     ].includes(check.code);
 
     /* BƯỚC 2: RENEW */
+
     if (checkSuccess || deviceExpired) {
         const renew = await callWorker("/renew");
 
@@ -252,6 +256,7 @@ async function ensureDeviceRegistered(signal) {
         }
 
         const notExpired = renew.code === "DEVICE_NOT_EXPIRED";
+
         const renewSuccess =
             renew.response.ok &&
             renew.data?.success === true;
@@ -272,6 +277,7 @@ async function ensureDeviceRegistered(signal) {
     }
 
     /* BƯỚC 3: REGISTER */
+
     if (deviceNotRegistered) {
         const registration = await callWorker("/register");
 
@@ -325,11 +331,13 @@ async function ensureDeviceRegistered(signal) {
 }
 
 /* ============================ DOM ======================== */
+
 const elements = {};
 
 document.addEventListener("DOMContentLoaded", init);
 
 async function init() {
+    injectQuizAlertStyles();
     initElements();
     bindEvents();
     applyViewMode();
@@ -385,6 +393,7 @@ function initElements() {
 }
 
 /* ============================ EVENTS ===================== */
+
 function bindEvents() {
     if (elements.refreshButton) {
         elements.refreshButton.addEventListener(
@@ -453,6 +462,7 @@ function bindEvents() {
 }
 
 /* ======================== LOAD QUIZZES =================== */
+
 async function loadQuizzes(showToast = false) {
     if (state.loading) {
         return;
@@ -488,9 +498,11 @@ async function loadQuizzes(showToast = false) {
         }, CONFIG.API_TIMEOUT);
 
         /* BƯỚC 1: CHECK -> RENEW hoặc REGISTER */
+
         await ensureDeviceRegistered(controller.signal);
 
         /* BƯỚC 2: Đọc lại thông tin thiết bị */
+
         const credentials = getDeviceCredentials();
 
         const deviceId = String(
@@ -509,6 +521,7 @@ async function loadQuizzes(showToast = false) {
         }
 
         /* BƯỚC 3: Gọi /list */
+
         const requestUrl = new URL(
             CONFIG.API_URL,
             window.location.origin
@@ -597,7 +610,9 @@ async function loadQuizzes(showToast = false) {
         }
 
         /* BƯỚC 4: Chuẩn hóa dữ liệu */
+
         const rawQuizzes = normalizeApiData(result);
+
         state.quizzes = normalizeQuizzes(rawQuizzes);
 
         filterAndRender();
@@ -611,6 +626,7 @@ async function loadQuizzes(showToast = false) {
                 "Đã cập nhật dữ liệu phiên Quiz."
             );
         }
+
     } catch (error) {
         console.error("QUIZ API ERROR:", error);
 
@@ -623,6 +639,7 @@ async function loadQuizzes(showToast = false) {
 
         updateCount();
         showError(getErrorMessage(error));
+
     } finally {
         if (timeout !== null) {
             clearTimeout(timeout);
@@ -635,6 +652,7 @@ async function loadQuizzes(showToast = false) {
 }
 
 /* ===================== NORMALIZE API DATA ================ */
+
 function normalizeApiData(result) {
     if (Array.isArray(result)) {
         return result;
@@ -670,6 +688,7 @@ function normalizeApiData(result) {
 }
 
 /* ===================== NORMALIZE QUIZZES ================= */
+
 function normalizeQuizzes(quizzes) {
     const normalized = [];
     const usedCodes = new Set();
@@ -726,8 +745,96 @@ function normalizeQuizzes(quizzes) {
 
     return normalized;
 }
-
 /* ====================== QUIZ STATUS ====================== */
+
+/* ====================== QUIZ ALERT PHASE ====================== */
+
+function getQuizAlertPhase(quiz, now = Date.now()) {
+    const startTime = parseQuizTime(quiz.startTime);
+    const endTime = parseQuizTime(quiz.endTime);
+
+    if (
+        startTime === null ||
+        endTime === null ||
+        startTime > endTime
+    ) {
+        return "";
+    }
+
+    // 5 giây ngay sau khi mở: xanh lá.
+    if (now >= startTime && now < startTime + 5000) {
+        return "green";
+    }
+
+    // 5 giây ngay sau khi đóng: đỏ.
+    if (now >= endTime && now < endTime + 5000) {
+        return "red";
+    }
+
+    // 30 giây trước khi mở hoặc đóng: vàng.
+    if (now < startTime && startTime - now <= 30000) {
+        return "yellow";
+    }
+
+    if (now < endTime && endTime - now <= 30000) {
+        return "yellow";
+    }
+
+    return "";
+}
+
+function injectQuizAlertStyles() {
+    if (document.getElementById("quizAlertAnimationStyles")) {
+        return;
+    }
+
+    const style = document.createElement("style");
+    style.id = "quizAlertAnimationStyles";
+
+    style.textContent = `
+        .quiz-card.quiz-alert-yellow,
+        .quiz-card.quiz-alert-green,
+        .quiz-card.quiz-alert-red {
+            animation: quizCardAlertBlink 0.8s steps(2, end) infinite;
+            will-change: background-color, border-color, box-shadow;
+        }
+
+        .quiz-card.quiz-alert-yellow {
+            --quiz-alert-bg: #fff4bf;
+            --quiz-alert-border: #eab308;
+            --quiz-alert-shadow: rgba(234, 179, 8, .28);
+        }
+
+        .quiz-card.quiz-alert-green {
+            --quiz-alert-bg: #d9fbe5;
+            --quiz-alert-border: #16a34a;
+            --quiz-alert-shadow: rgba(22, 163, 74, .30);
+        }
+
+        .quiz-card.quiz-alert-red {
+            --quiz-alert-bg: #ffe0e0;
+            --quiz-alert-border: #dc2626;
+            --quiz-alert-shadow: rgba(220, 38, 38, .30);
+        }
+
+        @keyframes quizCardAlertBlink {
+            0%, 49% {
+                background-color: var(--quiz-alert-bg);
+                border-color: var(--quiz-alert-border);
+                box-shadow: 0 0 0 3px var(--quiz-alert-shadow);
+            }
+
+            50%, 100% {
+                background-color: #ffffff;
+                border-color: var(--quiz-alert-border);
+                box-shadow: 0 0 0 0 transparent;
+            }
+        }
+    `;
+
+    document.head.appendChild(style);
+}
+
 function getQuizStatus(quiz) {
     const now = Date.now();
 
@@ -777,6 +884,7 @@ function getQuizStatus(quiz) {
 }
 
 /* ====================== PARSE QUIZ TIME ================== */
+
 function parseQuizTime(value) {
     if (
         value === null ||
@@ -832,6 +940,7 @@ function parseQuizTime(value) {
 }
 
 /* ====================== COUNTDOWN ======================== */
+
 function formatCountdown(milliseconds) {
     if (milliseconds <= 0) {
         return "đang bắt đầu...";
@@ -881,6 +990,7 @@ function formatCountdown(milliseconds) {
 }
 
 /* ============================ FILTER ===================== */
+
 function filterAndRender() {
     const keyword = state.searchText;
 
@@ -899,6 +1009,7 @@ function filterAndRender() {
     }
 
     /* Sắp xếp theo thời hạn trước khi hiển thị */
+
     state.filteredQuizzes = sortQuizzesByDeadline(
         state.filteredQuizzes
     );
@@ -946,6 +1057,7 @@ function sortQuizzesByDeadline(quizzes) {
                  * Thời điểm kết thúc càng gần hiện tại
                  * thì phiên vừa đóng càng được ưu tiên.
                  */
+
                 deadline: -(parseQuizTime(quiz.endTime) ?? 0)
             };
         }
@@ -980,6 +1092,7 @@ function sortQuizzesByDeadline(quizzes) {
 }
 
 /* ============================ RENDER ===================== */
+
 function renderQuizzes() {
     if (!elements.quizContainer) {
         return;
@@ -998,14 +1111,26 @@ function renderQuizzes() {
     });
 
     elements.quizContainer.appendChild(fragment);
+
     applyViewMode();
 }
-
 /* ======================== CREATE CARD ==================== */
+
 function createQuizCard(quiz) {
     const card = document.createElement("article");
+
     card.className = "quiz-card";
     card.dataset.code = quiz.code;
+
+    const alertPhase = getQuizAlertPhase(quiz);
+
+    if (alertPhase) {
+        card.classList.add("quiz-alert-" + alertPhase);
+
+        // Đồng bộ nhịp nhấp nháy khi danh sách tự cập nhật mỗi giây.
+        card.style.animationDelay =
+            "-" + ((Date.now() % 800) / 1000) + "s";
+    }
 
     const status = getQuizStatus(quiz);
 
@@ -1018,8 +1143,10 @@ function createQuizCard(quiz) {
         '<i class="fa-solid fa-graduation-cap"></i>';
 
     const statusBadge = document.createElement("span");
+
     statusBadge.className =
         "quiz-status status-" + status.type;
+
     statusBadge.textContent = status.text;
 
     top.appendChild(icon);
@@ -1041,13 +1168,16 @@ function createQuizCard(quiz) {
         description.textContent =
             "Vui lòng quay trở lại sau " +
             formatCountdown(startTime - Date.now());
+
     } else if (status.type === "closed") {
         description.textContent =
             "Phiên Quiz đã kết thúc.";
+
     } else if (status.type === "open") {
         description.textContent =
             quiz.description ||
             "Phiên Quiz đã sẵn sàng. Em có thể bắt đầu!";
+
     } else {
         description.textContent =
             "Chưa xác định được thời gian mở phiên Quiz.";
@@ -1059,6 +1189,7 @@ function createQuizCard(quiz) {
     if (status.canPlay) {
         const codeElement = document.createElement("div");
         codeElement.className = "quiz-code";
+
         codeElement.innerHTML =
             '<i class="fa-solid fa-hashtag"></i> ' +
             'Mã phiên: <strong></strong>';
@@ -1073,6 +1204,7 @@ function createQuizCard(quiz) {
     footer.className = "quiz-card-footer";
 
     const playButton = document.createElement("button");
+
     playButton.type = "button";
     playButton.className = "play-button";
 
@@ -1107,9 +1239,11 @@ function createQuizCard(quiz) {
                 openQuiz(quiz.code);
             }
         );
+
     } else {
         playButton.disabled = true;
         playButton.classList.add("disabled");
+
         playButton.innerHTML =
             '<i class="fa-solid fa-lock"></i>' +
             '<span></span>';
@@ -1119,6 +1253,7 @@ function createQuizCard(quiz) {
     }
 
     footer.appendChild(playButton);
+
     card.appendChild(top);
     card.appendChild(content);
     card.appendChild(footer);
@@ -1127,6 +1262,7 @@ function createQuizCard(quiz) {
 }
 
 /* =========================== OPEN QUIZ =================== */
+
 function openQuiz(code) {
     const cleanCode = String(code || "").trim();
 
@@ -1157,6 +1293,7 @@ function openQuiz(code) {
 }
 
 /* ========================== VIEW MODE ==================== */
+
 function loadSavedViewMode() {
     try {
         return localStorage.getItem(CONFIG.STORAGE_VIEW) === "list"
@@ -1212,6 +1349,7 @@ function applyViewMode() {
 }
 
 /* ============================ SEARCH ===================== */
+
 function clearSearch() {
     state.searchText = "";
 
@@ -1233,6 +1371,7 @@ function updateSearchButton() {
 }
 
 /* ============================ COUNT ====================== */
+
 function updateCount() {
     if (!elements.quizCount) {
         return;
@@ -1248,6 +1387,7 @@ function updateCount() {
 }
 
 /* ========================= EMPTY STATE =================== */
+
 function updateEmptyState() {
     if (!state.quizzes.length) {
         showEmpty(
@@ -1267,6 +1407,7 @@ function updateEmptyState() {
 }
 
 /* ============================ STATES ===================== */
+
 function showLoading() {
     if (elements.loadingState) {
         elements.loadingState.classList.remove("hidden");
@@ -1300,8 +1441,8 @@ function hideEmpty() {
         elements.emptyState.classList.add("hidden");
     }
 }
-
 /* ============================== ERROR =================== */
+
 function showError(message) {
     if (elements.errorMessage) {
         elements.errorMessage.textContent =
@@ -1383,6 +1524,7 @@ function hideError() {
 }
 
 /* ======================= ERROR MESSAGE =================== */
+
 function getErrorMessage(error) {
     if (error?.name === "AbortError") {
         return "API không phản hồi. Vui lòng thử lại.";
@@ -1412,6 +1554,7 @@ function getErrorMessage(error) {
 }
 
 /* ======================== REFRESH BUTTON ================ */
+
 function setRefreshLoading(loading) {
     if (elements.refreshButton) {
         elements.refreshButton.disabled = loading;
@@ -1430,6 +1573,7 @@ function setRefreshLoading(loading) {
 }
 
 /* ============================== TOAST ==================== */
+
 let toastTimer = null;
 
 function showToastMessage(message) {
@@ -1451,6 +1595,7 @@ function showToastMessage(message) {
 }
 
 /* ============================ KEYBOARD ================== */
+
 function handleKeyboard(event) {
     if (
         (event.ctrlKey || event.metaKey) &&
