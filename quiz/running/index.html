@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f8fafc">
+    <meta name="description" content="Quiz - Kho học tập">
+
+    <title>Quiz - Kho học tập</title>
+
+    <link rel="icon" type="image/png" href="../logo.png">
+
+    <!-- GOOGLE FONTS -->
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+        rel="stylesheet"
+    >
+
+    <!-- FONT AWESOME -->
+
+    <link
+        rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"
+    >
+
+    <!-- RUNNING CSS -->
+
+    <link rel="stylesheet" href="running.css">
+
+</head>
+
+<body>
+
+    <!-- ================= DEVICE LOADING OVERLAY ================= -->
+
+    <div
+        id="deviceLoadingOverlay"
+        class="device-loading-overlay"
+        role="alert"
+        aria-live="assertive"
+        aria-label="Đang tải thiết bị"
+    >
+
+        <div class="device-loading-content">
+
+            <div class="device-loading-icon">
+
+                <i class="fa-solid fa-mobile-screen-button"></i>
+
+                <span class="device-loading-spinner"></span>
+
+            </div>
+
+            <h3>Đang tải thiết bị</h3>
+
+            <p>
+                Vui lòng chờ trong giây lát...
+            </p>
+
+            <div class="device-loading-progress">
+                <span></span>
+            </div>
+
+        </div>
+
+    </div>
+
+    <!-- ================= QUIZ FRAME ================= -->
+
+    <iframe
+        id="quizFrame"
+        title="Quiz"
+        allow="fullscreen; autoplay; microphone; camera; clipboard-write"
+        allowfullscreen>
+    </iframe>
+
+    <!-- ================= STATUS PAGE ================= -->
+
+    <main id="statusPage">
+
+        <div class="status-box loading">
+
+            <div class="status-icon loading-spinner">
+                <i class="fa-solid fa-graduation-cap"></i>
+            </div>
+
+            <h2>Đang kiểm tra Quiz</h2>
+
+            <p>
+                Vui lòng chờ trong giây lát...
+            </p>
+
+        </div>
+
+    </main>
+
+    <!-- ================= SCRIPTS ================= -->
+
+    <script src="running.js"></script>
+    <script src="protect.js"></script>
+
+</body>
+
+</html>

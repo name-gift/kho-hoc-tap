@@ -1,0 +1,2312 @@
+
+"use strict";
+
+/* ======================== CONFIG ======================== */
+
+const CONFIG = {
+    API_BASE: "https://api-quiz.abcd1601ab.workers.dev",
+    API_URL: "https://api-quiz.abcd1601ab.workers.dev/list",
+    API_TIMEOUT: 20000,
+
+    // 1 lần kết nối ban đầu + 3 lần thử lại.
+    API_RETRY_ATTEMPTS: 4,
+
+    // Thời gian chờ giữa các lần thử lại.
+    API_RETRY_DELAYS: [800, 1600, 3000],
+
+    STORAGE_VIEW: "quiz_view_mode_v1",
+    STORAGE_DEVICE_ID: "kho_tai_lieu_device_id_v1",
+    STORAGE_DEVICE_TOKEN: "kho_tai_lieu_device_token_v1"
+};
+
+/* ======================== STATE ========================= */
+
+const state = {
+    quizzes: [],
+    filteredQuizzes: [],
+    searchText: "",
+    viewMode: loadSavedViewMode(),
+    loading: false
+};
+
+/* ================= DEVICE AUTHENTICATION ================ */
+
+/*
+ * QUY TRÌNH XÁC THỰC:
+ *
+ * 1. /check chỉ gửi deviceId.
+ * 2. Nếu thiết bị đang hoạt động hoặc hết hạn: gọi /renew.
+ * 3. Nếu thiết bị chưa đăng ký: gọi /register.
+ * 4. Lưu token mới nếu Worker trả về.
+ * 5. Gọi /list bằng deviceId và token mới nhất.
+ *
+ * Không tự động đăng ký lại khi gặp lỗi không xác định.
+ */
+
+/* ======================== API ERROR ====================== */
+
+function createApiError(message, code = "", status = 0) {
+    const error = new Error(
+        message || "Đã xảy ra lỗi khi gọi API."
+    );
+
+    error.code = code;
+    error.status = status;
+
+    return error;
+}
+
+function getErrorCode(result) {
+    return String(
+        result?.code ||
+        result?.errorCode ||
+        result?.error ||
+        result?.reason ||
+        ""
+    ).trim().toUpperCase();
+}
+
+/* ======================== DEVICE INFO ==================== */
+
+function getDeviceCredentials() {
+    try {
+        return {
+            deviceId:
+                localStorage.getItem(CONFIG.STORAGE_DEVICE_ID) || "",
+
+            deviceToken:
+                localStorage.getItem(CONFIG.STORAGE_DEVICE_TOKEN) || ""
+        };
+    } catch (error) {
+        console.error("Không thể đọc thông tin thiết bị:", error);
+
+        return {
+            deviceId: "",
+            deviceToken: ""
+        };
+    }
+}
+
+function createDeviceId() {
+    if (
+        typeof crypto !== "undefined" &&
+        typeof crypto.randomUUID === "function"
+    ) {
+        return crypto.randomUUID();
+    }
+
+    return (
+        "device_" +
+        Date.now().toString(36) +
+        "_" +
+        Math.random().toString(36).slice(2) +
+        Math.random().toString(36).slice(2)
+    );
+}
+
+/* ================= DEVICE LOADING MESSAGE ================= */
+
+function updateDeviceLoadingMessage(message) {
+    const overlay = elements.deviceLoadingOverlay;
+
+    if (!overlay) {
+        return;
+    }
+
+    const selectors = [
+        "[data-device-loading-message]",
+        "#deviceLoadingMessage",
+        ".device-loading-message",
+        ".loading-message",
+        "p",
+        "span"
+    ];
+
+    for (const selector of selectors) {
+        const target = overlay.querySelector(selector);
+
+        if (target) {
+            target.textContent = message;
+            return;
+        }
+    }
+}
+
+/* ======================== SLEEP ========================== */
+
+function sleep(milliseconds, signal) {
+    return new Promise(function(resolve, reject) {
+        if (signal?.aborted) {
+            reject(
+                createApiError("Yêu cầu đã bị hủy.")
+            );
+
+            return;
+        }
+
+        let timer = null;
+
+        function cleanup() {
+            if (timer !== null) {
+                clearTimeout(timer);
+            }
+
+            if (signal) {
+                signal.removeEventListener(
+                    "abort",
+                    handleAbort
+                );
+            }
+        }
+
+        function handleAbort() {
+            cleanup();
+
+            reject(
+                createApiError("Yêu cầu đã bị hủy.")
+            );
+        }
+
+        timer = setTimeout(function() {
+            cleanup();
+            resolve();
+        }, milliseconds);
+
+        if (signal) {
+            signal.addEventListener(
+                "abort",
+                handleAbort,
+                { once: true }
+            );
+        }
+    });
+}
+
+/* ======================== HTTP STATUS ==================== */
+
+function isRetryableHttpStatus(status) {
+    return (
+        status === 408 ||
+        status === 429 ||
+        status >= 500
+    );
+}
+
+/* ======================== FETCH RETRY ==================== */
+
+async function fetchJsonWithRetry(
+    url,
+    options = {},
+    signal = null,
+    requestName = "API"
+) {
+    const maxAttempts = Math.max(
+        1,
+        Number(CONFIG.API_RETRY_ATTEMPTS) || 4
+    );
+
+    let lastError = null;
+
+    for (
+        let attempt = 1;
+        attempt <= maxAttempts;
+        attempt++
+    ) {
+        if (signal?.aborted) {
+            throw createApiError(
+                "Yêu cầu đã bị hủy."
+            );
+        }
+
+        const controller = new AbortController();
+
+        let timeout = null;
+        let externalAbortHandler = null;
+        let timedOut = false;
+
+        try {
+            if (signal) {
+                externalAbortHandler = function() {
+                    controller.abort();
+                };
+
+                signal.addEventListener(
+                    "abort",
+                    externalAbortHandler,
+                    { once: true }
+                );
+            }
+
+            timeout = setTimeout(function() {
+                timedOut = true;
+                controller.abort();
+            }, CONFIG.API_TIMEOUT);
+
+            const response = await fetch(
+                url,
+                {
+                    ...options,
+                    signal: controller.signal
+                }
+            );
+
+            if (isRetryableHttpStatus(response.status)) {
+                throw Object.assign(
+                    new Error(
+                        "API tạm thời không phản hồi. HTTP " +
+                        response.status
+                    ),
+                    {
+                        retryable: true,
+                        status: response.status
+                    }
+                );
+            }
+
+            let data;
+
+            try {
+                data = await response.json();
+
+            } catch (error) {
+                throw Object.assign(
+                    createApiError(
+                        "API không trả về JSON hợp lệ."
+                    ),
+                    {
+                        retryable: true
+                    }
+                );
+            }
+
+            return {
+                response,
+                data,
+                code: getErrorCode(data)
+            };
+
+        } catch (error) {
+            if (signal?.aborted) {
+                throw createApiError(
+                    "Yêu cầu đã bị hủy."
+                );
+            }
+
+            const isTimeout =
+                timedOut ||
+                error?.name === "TimeoutError";
+
+            const isNetworkError =
+                error?.name === "TypeError" ||
+                error?.name === "AbortError" ||
+                error?.retryable === true ||
+                isTimeout;
+
+            if (!isNetworkError) {
+                throw error;
+            }
+
+            lastError = error;
+
+            if (attempt >= maxAttempts) {
+                console.error(
+                    requestName + " thất bại sau " +
+                    (maxAttempts - 1) + " lần thử lại.",
+                    lastError
+                );
+
+                throw createApiError(
+                    "Failed to fetch",
+                    "API_CONNECTION_FAILED"
+                );
+            }
+
+        } finally {
+            if (timeout !== null) {
+                clearTimeout(timeout);
+            }
+
+            if (
+                signal &&
+                externalAbortHandler
+            ) {
+                signal.removeEventListener(
+                    "abort",
+                    externalAbortHandler
+                );
+            }
+        }
+
+        const delay =
+            CONFIG.API_RETRY_DELAYS[attempt - 1] || 3000;
+
+        const nextRetry = attempt;
+
+        const message =
+            "Mất kết nối! Đang thử lại lần " +
+            nextRetry +
+            "/3...";
+
+        console.warn(
+            message,
+            lastError
+        );
+
+        showDeviceLoading();
+        updateDeviceLoadingMessage(message);
+
+        await sleep(delay, signal);
+    }
+
+    throw createApiError(
+        "Failed to fetch",
+        "API_CONNECTION_FAILED"
+    );
+}
+
+/* ======================= API REQUEST ===================== */
+
+async function ensureDeviceRegistered(signal) {
+    const credentials = getDeviceCredentials();
+
+    let deviceId = String(
+        credentials.deviceId || ""
+    ).trim();
+
+    let deviceToken = String(
+        credentials.deviceToken || ""
+    ).trim();
+
+    if (!deviceId) {
+        deviceId = createDeviceId();
+
+        try {
+            localStorage.setItem(
+                CONFIG.STORAGE_DEVICE_ID,
+                deviceId
+            );
+
+        } catch (error) {
+            throw createApiError(
+                "Trình duyệt không cho phép lưu thông tin thiết bị."
+            );
+        }
+    }
+
+    const apiBase = CONFIG.API_BASE.replace(/\/+$/, "");
+
+    async function callWorker(path, params = {}) {
+        const cleanPath = String(path)
+            .replace(/^\/+|\/+$/g, "");
+
+        const normalizedPath = "/" + cleanPath.toLowerCase();
+
+        const url = new URL(
+            apiBase + "/" + cleanPath
+        );
+
+        url.searchParams.set(
+            "deviceId",
+            deviceId
+        );
+
+        /*
+         * CHECK chỉ gửi deviceId.
+         * Không gửi deviceToken.
+         */
+
+        if (
+            normalizedPath !== "/check" &&
+            deviceToken
+        ) {
+            url.searchParams.set(
+                "deviceToken",
+                deviceToken
+            );
+        }
+
+        Object.entries(params).forEach(function([key, value]) {
+            if (
+                value !== undefined &&
+                value !== null &&
+                value !== ""
+            ) {
+                url.searchParams.set(
+                    key,
+                    String(value)
+                );
+            }
+        });
+
+        url.searchParams.set(
+            "_refresh",
+            Date.now().toString()
+        );
+
+        const headers = {
+            "Accept": "application/json"
+        };
+
+        if (normalizedPath !== "/check") {
+            headers["X-Device-Id"] = deviceId;
+
+            if (deviceToken) {
+                headers["X-Device-Token"] = deviceToken;
+            }
+        }
+
+        return await fetchJsonWithRetry(
+            url.toString(),
+            {
+                method: "GET",
+                headers,
+                cache: "no-store"
+            },
+            signal,
+            normalizedPath
+        );
+    }
+
+    function throwWorkerError(result, fallback) {
+        throw createApiError(
+            result.data?.message ||
+            result.data?.error_description ||
+            fallback,
+            result.code,
+            result.response?.status || 0
+        );
+    }
+
+    function saveReturnedDeviceId(data) {
+        const returnedId =
+            data?.deviceId ??
+            data?.data?.deviceId ??
+            data?.result?.deviceId;
+
+        if (
+            returnedId === undefined ||
+            returnedId === null ||
+            String(returnedId).trim() === ""
+        ) {
+            return true;
+        }
+
+        const newDeviceId = String(returnedId).trim();
+
+        try {
+            localStorage.setItem(
+                CONFIG.STORAGE_DEVICE_ID,
+                newDeviceId
+            );
+
+            deviceId = newDeviceId;
+
+            return true;
+
+        } catch (error) {
+            throw createApiError(
+                "Không thể lưu deviceId vào trình duyệt."
+            );
+        }
+    }
+
+    function saveReturnedToken(data) {
+        const token =
+            data?.deviceToken ??
+            data?.token ??
+            data?.data?.deviceToken ??
+            data?.data?.token ??
+            data?.result?.deviceToken ??
+            data?.result?.token;
+
+        if (
+            token === undefined ||
+            token === null ||
+            String(token).trim() === ""
+        ) {
+            return false;
+        }
+
+        const newToken = String(token).trim();
+
+        try {
+            localStorage.setItem(
+                CONFIG.STORAGE_DEVICE_TOKEN,
+                newToken
+            );
+
+            deviceToken = newToken;
+
+            return true;
+
+        } catch (error) {
+            throw createApiError(
+                "Đã nhận token mới nhưng không thể lưu vào trình duyệt."
+            );
+        }
+    }
+
+    function finishDeviceAuthentication() {
+        if (!deviceId || !deviceToken) {
+            throw createApiError(
+                "Không có deviceId hoặc deviceToken hợp lệ.",
+                "TOKEN_MISSING"
+            );
+        }
+
+        updateDeviceLoadingMessage(
+            "Đang tải danh sách Quiz..."
+        );
+
+        return {
+            deviceId,
+            deviceToken
+        };
+    }
+
+    /* ================= BƯỚC 1: CHECK ================= */
+
+    updateDeviceLoadingMessage(
+        "Đang xác minh thiết bị..."
+    );
+
+    const check = await callWorker("/check");
+
+    if (
+        check.code === "DEVICE_LOCKED" ||
+        check.data?.locked === true
+    ) {
+        throwWorkerError(
+            check,
+            "Thiết bị đã bị khóa và không được phép truy cập."
+        );
+    }
+
+    const checkStatus = String(
+        check.data?.status || ""
+    ).trim().toLowerCase();
+
+    if (
+        check.response.ok &&
+        check.data?.success === true &&
+        checkStatus === "active"
+    ) {
+        saveReturnedDeviceId(check.data);
+
+        const hasToken = saveReturnedToken(check.data);
+
+        if (!hasToken || !deviceToken) {
+            throw createApiError(
+                "Worker không trả về deviceToken hợp lệ.",
+                "TOKEN_MISSING"
+            );
+        }
+
+        return finishDeviceAuthentication();
+    }
+
+    const deviceExpired =
+        check.code === "DEVICE_EXPIRED" ||
+        check.data?.error === "DEVICE_EXPIRED";
+
+    const deviceNotRegistered = [
+        "DEVICE_UNREGISTERED",
+        "DEVICE_NOT_FOUND"
+    ].includes(check.code);
+
+    /* ================= BƯỚC 2: RENEW ================= */
+
+    const checkNeedsRenew =
+        check.response.ok &&
+        check.data?.success === true &&
+        (
+            checkStatus === "active" ||
+            checkStatus === "registered" ||
+            checkStatus === "valid"
+        );
+
+    if (deviceExpired || checkNeedsRenew) {
+        updateDeviceLoadingMessage(
+            "Đang gia hạn xác thực thiết bị..."
+        );
+
+        const renew = await callWorker("/renew");
+
+        if (
+            renew.code === "DEVICE_LOCKED" ||
+            renew.data?.locked === true
+        ) {
+            throwWorkerError(
+                renew,
+                "Thiết bị đã bị khóa và không được phép truy cập."
+            );
+        }
+
+        const notExpired =
+            renew.code === "DEVICE_NOT_EXPIRED";
+
+        const renewSuccess =
+            renew.response.ok &&
+            renew.data?.success === true;
+
+        if (!renewSuccess && !notExpired) {
+            throwWorkerError(
+                renew,
+                "Không thể gia hạn hoặc xác minh thiết bị."
+            );
+        }
+
+        saveReturnedDeviceId(renew.data);
+
+        const hasToken = saveReturnedToken(renew.data);
+
+        if (!hasToken || !deviceToken) {
+            throw createApiError(
+                "Không có deviceToken hợp lệ sau khi gia hạn thiết bị.",
+                "TOKEN_MISSING"
+            );
+        }
+
+        return finishDeviceAuthentication();
+    }
+
+    /* ================= BƯỚC 3: REGISTER ================= */
+
+    if (deviceNotRegistered) {
+        updateDeviceLoadingMessage(
+            "Đang đăng ký thiết bị..."
+        );
+
+        const registration = await callWorker("/register");
+
+        if (
+            !registration.response.ok ||
+            registration.data?.success !== true
+        ) {
+            throwWorkerError(
+                registration,
+                "Đăng ký thiết bị thất bại."
+            );
+        }
+
+        saveReturnedDeviceId(registration.data);
+
+        const hasToken = saveReturnedToken(registration.data);
+
+        if (!hasToken || !deviceToken) {
+            throw createApiError(
+                "Đăng ký thành công nhưng Worker không trả về deviceToken.",
+                "TOKEN_MISSING"
+            );
+        }
+
+        return finishDeviceAuthentication();
+    }
+
+    /* ================= BƯỚC 4: LỖI ================= */
+
+    throwWorkerError(
+        check,
+        "Không thể xác minh thiết bị. Vui lòng thử lại."
+    );
+}
+
+/* ============================ DOM ======================== */
+
+const elements = {};
+
+document.addEventListener("DOMContentLoaded", init);
+
+async function init() {
+    injectQuizAlertStyles();
+
+    initElements();
+    bindEvents();
+
+    applyViewMode();
+    updateSearchButton();
+
+    await loadQuizzes(false);
+}
+
+function initElements() {
+    elements.refreshButton =
+        document.getElementById("refreshButton");
+
+    elements.searchInput =
+        document.getElementById("searchInput");
+
+    elements.clearSearch =
+        document.getElementById("clearSearch");
+
+    elements.gridViewButton =
+        document.getElementById("gridViewButton");
+
+    elements.listViewButton =
+        document.getElementById("listViewButton");
+
+    elements.quizCount =
+        document.getElementById("quizCount");
+
+    elements.quizContainer =
+        document.getElementById("quizContainer");
+
+    elements.loadingState =
+        document.getElementById("loadingState");
+
+    elements.errorState =
+        document.getElementById("errorState");
+
+    elements.errorMessage =
+        document.getElementById("errorMessage");
+
+    elements.retryButton =
+        document.getElementById("retryButton");
+
+    elements.emptyState =
+        document.getElementById("emptyState");
+
+    elements.emptyMessage =
+        document.getElementById("emptyMessage");
+
+    elements.toast =
+        document.getElementById("toast");
+
+    elements.toastMessage =
+        document.getElementById("toastMessage");
+
+    elements.deviceLoadingOverlay =
+        document.getElementById("deviceLoadingOverlay");
+}
+
+/* ============================ EVENTS ===================== */
+
+function bindEvents() {
+    if (elements.refreshButton) {
+        elements.refreshButton.addEventListener(
+            "click",
+            function() {
+                loadQuizzes(true);
+            }
+        );
+    }
+
+    if (elements.retryButton) {
+        elements.retryButton.addEventListener(
+            "click",
+            function() {
+                loadQuizzes(true);
+            }
+        );
+    }
+
+    if (elements.searchInput) {
+        elements.searchInput.addEventListener(
+            "input",
+            function() {
+                state.searchText = this.value
+                    .trim()
+                    .toLowerCase();
+
+                updateSearchButton();
+                filterAndRender();
+            }
+        );
+    }
+
+    if (elements.clearSearch) {
+        elements.clearSearch.addEventListener(
+            "click",
+            function() {
+                clearSearch();
+
+                if (elements.searchInput) {
+                    elements.searchInput.focus();
+                }
+            }
+        );
+    }
+
+    if (elements.gridViewButton) {
+        elements.gridViewButton.addEventListener(
+            "click",
+            function() {
+                setViewMode("grid");
+            }
+        );
+    }
+
+    if (elements.listViewButton) {
+        elements.listViewButton.addEventListener(
+            "click",
+            function() {
+                setViewMode("list");
+            }
+        );
+    }
+
+    window.addEventListener("keydown", handleKeyboard);
+}
+
+/* ================= DEVICE LOADING OVERLAY ================= */
+
+function showDeviceLoading() {
+    if (!elements.deviceLoadingOverlay) {
+        return;
+    }
+
+    elements.deviceLoadingOverlay.style.display = "flex";
+
+    elements.deviceLoadingOverlay.setAttribute(
+        "aria-hidden",
+        "false"
+    );
+}
+
+function hideDeviceLoading() {
+    if (!elements.deviceLoadingOverlay) {
+        return;
+    }
+
+    elements.deviceLoadingOverlay.style.display = "none";
+
+    elements.deviceLoadingOverlay.setAttribute(
+        "aria-hidden",
+        "true"
+    );
+}
+
+/* ============ CLEAR QUIZ PAGE AFTER FAILURE ============ */
+
+function clearQuizPageAfterFailure() {
+    state.quizzes = [];
+    state.filteredQuizzes = [];
+    state.searchText = "";
+
+    if (elements.quizContainer) {
+        elements.quizContainer.innerHTML = "";
+    }
+
+    if (elements.quizCount) {
+        elements.quizCount.textContent = "0 phiên";
+    }
+
+    if (elements.searchInput) {
+        elements.searchInput.value = "";
+    }
+
+    hideEmpty();
+    hideLoading();
+    hideDeviceLoading();
+
+    updateSearchButton();
+}
+
+/* ================= FAILED TO FETCH SCREEN ================= */
+
+/*
+ * Thay thế toàn bộ tài liệu HTML hiện tại.
+ *
+ * Sau khi gọi hàm này:
+ * - Không còn nội dung trang Quiz cũ.
+ * - Không còn nút tìm kiếm, làm mới hoặc danh sách Quiz.
+ * - Chỉ hiển thị thông báo Không thể kết nối API.
+ * - Hiển thị chi tiết Failed to fetch.
+ */
+
+function showFailedToFetch() {
+    const errorPage = `<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#f6f8fb">
+    <title>Không thể kết nối API</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            min-height: 100%;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+            background: #f6f8fb;
+            font-family: Arial, Helvetica, sans-serif;
+            color: #111827;
+        }
+
+        .failed-container {
+            width: 100%;
+            max-width: 365px;
+            min-height: 230px;
+            padding: 44px 30px 38px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 21px;
+            box-shadow: 0 18px 45px rgba(15, 23, 42, 0.07);
+            text-align: center;
+        }
+
+        .failed-icon {
+            width: 35px;
+            height: 35px;
+            margin-bottom: 39px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #ef4444;
+            font-size: 29px;
+            font-weight: 700;
+            line-height: 1;
+        }
+
+        .failed-title {
+            margin: 0 0 12px;
+            color: #111827;
+            font-size: 20px;
+            font-weight: 700;
+            line-height: 1.4;
+        }
+
+        .failed-message {
+            margin: 0;
+            color: #64748b;
+            font-size: 14px;
+            font-weight: 400;
+            line-height: 1.5;
+        }
+
+        @media (max-width: 480px) {
+            .failed-container {
+                max-width: 365px;
+                min-height: 215px;
+                padding: 35px 22px;
+                border-radius: 18px;
+            }
+
+            .failed-title {
+                font-size: 19px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <main class="failed-container">
+        <div class="failed-icon">!</div>
+
+        <h2 class="failed-title">
+            Không thể kết nối API
+        </h2>
+
+        <p class="failed-message">
+            Failed to fetch
+        </p>
+    </main>
+</body>
+</html>`;
+
+    /*
+     * Mở tài liệu mới và thay thế hoàn toàn trang cũ.
+     * Cách này ổn định hơn việc xóa rồi tự tạo lại HEAD/BODY.
+     */
+
+    try {
+        document.open();
+        document.write(errorPage);
+        document.close();
+
+    } catch (error) {
+        console.error(
+            "Không thể hiển thị trang lỗi API:",
+            error
+        );
+
+        /*
+         * Phương án dự phòng nếu document.write thất bại.
+         */
+
+        document.documentElement.innerHTML = errorPage
+            .replace(/^<!DOCTYPE html>/i, "")
+            .replace(/<\/?html[^>]*>/gi, "")
+            .replace(/<\/?body[^>]*>/gi, "")
+            .replace(/<\/?head[^>]*>/gi, "");
+    }
+}
+
+/* ======================== LOAD QUIZZES =================== */
+
+async function loadQuizzes(showToast = false) {
+    if (state.loading) {
+        return;
+    }
+
+    state.loading = true;
+
+    setRefreshLoading(true);
+
+    state.quizzes = [];
+    state.filteredQuizzes = [];
+
+    if (elements.quizContainer) {
+        elements.quizContainer.innerHTML = "";
+    }
+
+    updateCount();
+    showLoading();
+
+    showDeviceLoading();
+
+    try {
+        if (!CONFIG.API_BASE || !CONFIG.API_URL) {
+            throw createApiError(
+                "Chưa cấu hình API trong quiz.js."
+            );
+        }
+
+        /*
+         * BƯỚC 1:
+         * CHECK -> RENEW hoặc REGISTER.
+         */
+
+        await ensureDeviceRegistered();
+
+        /*
+         * BƯỚC 2:
+         * Đọc lại thông tin thiết bị sau xác thực.
+         */
+
+        const credentials = getDeviceCredentials();
+
+        const deviceId = String(
+            credentials.deviceId || ""
+        ).trim();
+
+        const deviceToken = String(
+            credentials.deviceToken || ""
+        ).trim();
+
+        if (!deviceId) {
+            throw createApiError(
+                "Thiếu deviceId sau khi xác thực thiết bị. " +
+                "Vui lòng tải lại trang."
+            );
+        }
+
+        if (!deviceToken) {
+            throw createApiError(
+                "Thiếu deviceToken sau khi xác thực thiết bị.",
+                "TOKEN_MISSING"
+            );
+        }
+
+        /*
+         * BƯỚC 3:
+         * Gọi /list?deviceId=...&deviceToken=...
+         */
+
+        updateDeviceLoadingMessage(
+            "Đang tải danh sách Quiz..."
+        );
+
+        const requestUrl = new URL(CONFIG.API_URL);
+
+        requestUrl.searchParams.set(
+            "deviceId",
+            deviceId
+        );
+
+        requestUrl.searchParams.set(
+            "deviceToken",
+            deviceToken
+        );
+
+        requestUrl.searchParams.set(
+            "_refresh",
+            Date.now().toString()
+        );
+
+        const headers = {
+            "Accept": "application/json",
+            "X-Device-Id": deviceId,
+            "X-Device-Token": deviceToken
+        };
+
+        const result = await fetchJsonWithRetry(
+            requestUrl.toString(),
+            {
+                method: "GET",
+                headers,
+                cache: "no-store"
+            },
+            null,
+            "/list"
+        );
+
+        const response = result.response;
+        const data = result.data;
+
+        const errorCode = getErrorCode(data);
+
+        const deviceErrorCodes = [
+            "DEVICE_LOCKED",
+            "DEVICE_UNREGISTERED",
+            "DEVICE_NOT_FOUND",
+            "DEVICE_ID_MISSING",
+            "DEVICE_EXPIRED",
+            "TOKEN_INVALID",
+            "TOKEN_MISSING",
+            "DEVICE_TOKEN_MISSING",
+            "IP_NOT_FOUND",
+            "IP_MISSING"
+        ];
+
+        if (deviceErrorCodes.includes(errorCode)) {
+            throw createApiError(
+                data?.message ||
+                "Thiết bị chưa được xác thực hoặc không được phép truy cập.",
+                errorCode,
+                response.status
+            );
+        }
+
+        if (!response.ok) {
+            throw createApiError(
+                data?.message ||
+                "API trả về HTTP " + response.status,
+                errorCode,
+                response.status
+            );
+        }
+
+        if (data?.success === false) {
+            throw createApiError(
+                data.message ||
+                "API Quiz từ chối truy cập.",
+                errorCode,
+                response.status
+            );
+        }
+
+        /*
+         * BƯỚC 4:
+         * Chuẩn hóa dữ liệu.
+         */
+
+        const rawQuizzes = normalizeApiData(data);
+
+        state.quizzes = normalizeQuizzes(rawQuizzes);
+
+        filterAndRender();
+
+        hideDeviceLoading();
+
+        if (state.quizzes.length === 0) {
+            showEmpty(
+                "Hiện chưa có phiên Quiz nào được mở."
+            );
+
+        } else if (showToast) {
+            showToastMessage(
+                "Đã cập nhật dữ liệu phiên Quiz."
+            );
+        }
+
+    } catch (error) {
+        console.error("QUIZ API ERROR:", error);
+
+        /*
+         * API KHÔNG KẾT NỐI ĐƯỢC:
+         * Sau lần đầu + 3 lần thử lại,
+         * chỉ hiển thị trang lỗi Failed to fetch.
+         *
+         * Kiểm tra cả code và message để tránh
+         * trường hợp lỗi bị chuyển đổi ở một bước khác.
+         */
+
+        if (
+            error?.code === "API_CONNECTION_FAILED" ||
+            error?.message === "Failed to fetch"
+        ) {
+            showFailedToFetch();
+            return;
+        }
+
+        /*
+         * Các lỗi khác vẫn xử lý như cũ.
+         */
+
+        clearQuizPageAfterFailure();
+
+        showError(
+            getErrorMessage(error)
+        );
+
+    } finally {
+        hideLoading();
+
+        state.loading = false;
+
+        setRefreshLoading(false);
+    }
+}
+
+/* ===================== NORMALIZE API DATA ================ */
+
+function normalizeApiData(result) {
+    if (Array.isArray(result)) {
+        return result;
+    }
+
+    if (result && Array.isArray(result.quizzes)) {
+        return result.quizzes;
+    }
+
+    if (result && Array.isArray(result.data)) {
+        return result.data;
+    }
+
+    if (result && Array.isArray(result.items)) {
+        return result.items;
+    }
+
+    if (result && Array.isArray(result.results)) {
+        return result.results;
+    }
+
+    if (
+        result?.data &&
+        Array.isArray(result.data.quizzes)
+    ) {
+        return result.data.quizzes;
+    }
+
+    throw createApiError(
+        result?.message ||
+        "Dữ liệu API không có danh sách phiên Quiz hợp lệ."
+    );
+}
+
+/* ===================== NORMALIZE QUIZZES ================= */
+
+function normalizeQuizzes(quizzes) {
+    const normalized = [];
+    const usedCodes = new Set();
+
+    quizzes.forEach(function(item) {
+        if (!item || typeof item !== "object") {
+            return;
+        }
+
+        const code = String(
+            item.code ?? item.quizCode ?? ""
+        ).trim();
+
+        if (
+            !code ||
+            !/^\d+$/.test(code) ||
+            usedCodes.has(code)
+        ) {
+            return;
+        }
+
+        const quizEndTime =
+            item.endTime ??
+            item.end_time ??
+            item.end ??
+            "";
+
+        /*
+         * Ẩn Quiz đã hết hạn từ 7 ngày trở lên.
+         */
+
+        const quizEndTimestamp = parseQuizTime(quizEndTime);
+
+        const QUIZ_RETENTION_MS =
+            7 * 24 * 60 * 60 * 1000;
+
+        if (
+            quizEndTimestamp !== null &&
+            Date.now() - quizEndTimestamp >= QUIZ_RETENTION_MS
+        ) {
+            return;
+        }
+
+        usedCodes.add(code);
+
+        normalized.push({
+            id: String(item.id ?? "").trim(),
+
+            name: String(
+                item.name ||
+                item.title ||
+                "Quiz"
+            ).trim(),
+
+            code,
+
+            description: String(
+                item.description ||
+                item.desc ||
+                ""
+            ).trim(),
+
+            startTime:
+                item.startTime ??
+                item.start_time ??
+                item.start ??
+                "",
+
+            endTime:
+                item.endTime ??
+                item.end_time ??
+                item.end ??
+                ""
+        });
+    });
+
+    return normalized;
+}
+
+/* ====================== QUIZ ALERT PHASE ====================== */
+
+function getQuizAlertPhase(quiz, now = Date.now()) {
+    const startTime = parseQuizTime(quiz.startTime);
+    const endTime = parseQuizTime(quiz.endTime);
+
+    if (
+        startTime === null ||
+        endTime === null ||
+        startTime > endTime
+    ) {
+        return "";
+    }
+
+    /*
+     * 5 giây ngay sau khi mở: xanh lá.
+     */
+
+    if (
+        now >= startTime &&
+        now < startTime + 5000
+    ) {
+        return "green";
+    }
+
+    /*
+     * 5 giây ngay sau khi đóng: đỏ.
+     */
+
+    if (
+        now >= endTime &&
+        now < endTime + 5000
+    ) {
+        return "red";
+    }
+
+    /*
+     * 30 giây trước khi mở hoặc đóng: vàng.
+     */
+
+    if (
+        now < startTime &&
+        startTime - now <= 30000
+    ) {
+        return "yellow";
+    }
+
+    if (
+        now < endTime &&
+        endTime - now <= 30000
+    ) {
+        return "yellow";
+    }
+
+    return "";
+}
+
+/* ====================== ALERT STYLES ====================== */
+
+function injectQuizAlertStyles() {
+    if (
+        document.getElementById(
+            "quizAlertAnimationStyles"
+        )
+    ) {
+        return;
+    }
+
+    const style = document.createElement("style");
+
+    style.id = "quizAlertAnimationStyles";
+
+    style.textContent = `
+        .quiz-card.quiz-alert-yellow,
+        .quiz-card.quiz-alert-green,
+        .quiz-card.quiz-alert-red {
+            animation: quizCardAlertBlink 0.8s steps(2, end) infinite;
+            will-change: background-color, border-color, box-shadow;
+        }
+
+        .quiz-card.quiz-alert-yellow {
+            --quiz-alert-bg: #fff4bf;
+            --quiz-alert-border: #eab308;
+            --quiz-alert-shadow: rgba(234, 179, 8, .28);
+        }
+
+        .quiz-card.quiz-alert-green {
+            --quiz-alert-bg: #d9fbe5;
+            --quiz-alert-border: #16a34a;
+            --quiz-alert-shadow: rgba(22, 163, 74, .30);
+        }
+
+        .quiz-card.quiz-alert-red {
+            --quiz-alert-bg: #ffe0e0;
+            --quiz-alert-border: #dc2626;
+            --quiz-alert-shadow: rgba(220, 38, 38, .30);
+        }
+
+        @keyframes quizCardAlertBlink {
+            0%, 49% {
+                background-color: var(--quiz-alert-bg);
+                border-color: var(--quiz-alert-border);
+                box-shadow: 0 0 0 3px var(--quiz-alert-shadow);
+            }
+
+            50%, 100% {
+                background-color: #ffffff;
+                border-color: var(--quiz-alert-border);
+                box-shadow: 0 0 0 0 transparent;
+            }
+        }
+    `;
+
+    document.head.appendChild(style);
+}
+
+/* ====================== GET QUIZ STATUS ====================== */
+
+function getQuizStatus(quiz) {
+    const now = Date.now();
+
+    const startTime = parseQuizTime(quiz.startTime);
+    const endTime = parseQuizTime(quiz.endTime);
+
+    if (
+        startTime === null ||
+        endTime === null ||
+        startTime > endTime
+    ) {
+        return {
+            type: "invalid",
+            text: "Chưa xác định",
+            canPlay: false
+        };
+    }
+
+    if (now < startTime) {
+        return {
+            type: "upcoming",
+            text: "Chưa mở",
+            canPlay: false
+        };
+    }
+
+    if (now >= endTime) {
+        return {
+            type: "closed",
+            text: "Đã đóng",
+            canPlay: false
+        };
+    }
+
+    return {
+        type: "open",
+        text: "Đang mở",
+        canPlay: true
+    };
+}
+
+/* ====================== PARSE QUIZ TIME ================== */
+
+function parseQuizTime(value) {
+    if (
+        value === null ||
+        value === undefined ||
+        value === ""
+    ) {
+        return null;
+    }
+
+    if (
+        typeof value === "number" &&
+        Number.isFinite(value)
+    ) {
+        const timestamp =
+            value < 1000000000000
+                ? value * 1000
+                : value;
+
+        return Number.isFinite(timestamp)
+            ? timestamp
+            : null;
+    }
+
+    /*
+     * Chuỗi YYYY-MM-DDTHH:mm:ss không có múi giờ
+     * được hiểu theo giờ Việt Nam UTC+07:00.
+     *
+     * Nếu chuỗi đã có Z hoặc độ lệch múi giờ,
+     * giữ nguyên múi giờ được cung cấp.
+     */
+
+    let dateString = String(value).trim();
+
+    const hasExplicitTimezone =
+        /(?:Z|[+-]\d{2}:?\d{2})$/i.test(dateString);
+
+    if (
+        !hasExplicitTimezone &&
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/.test(dateString)
+    ) {
+        dateString += "+07:00";
+    }
+
+    const parsed = Date.parse(dateString);
+
+    return Number.isFinite(parsed)
+        ? parsed
+        : null;
+}
+
+/* ====================== COUNTDOWN ======================== */
+
+function formatCountdown(milliseconds) {
+    if (milliseconds <= 0) {
+        return "đang bắt đầu...";
+    }
+
+    const totalSeconds = Math.floor(
+        milliseconds / 1000
+    );
+
+    const days = Math.floor(
+        totalSeconds / 86400
+    );
+
+    const hours = Math.floor(
+        (totalSeconds % 86400) / 3600
+    );
+
+    const minutes = Math.floor(
+        (totalSeconds % 3600) / 60
+    );
+
+    const seconds = totalSeconds % 60;
+
+    const parts = [];
+
+    if (days > 0) {
+        parts.push(days + " ngày");
+    }
+
+    if (hours > 0) {
+        parts.push(hours + " giờ");
+    }
+
+    if (minutes > 0) {
+        parts.push(minutes + " phút");
+    }
+
+    if (days === 0 && seconds > 0) {
+        parts.push(seconds + " giây");
+    }
+
+    if (parts.length === 0) {
+        parts.push("dưới 1 giây");
+    }
+
+    return parts.join(" ");
+}
+
+/* ============================ FILTER ===================== */
+
+function filterAndRender() {
+    const keyword = state.searchText;
+    const now = Date.now();
+
+    const QUIZ_RETENTION_MS =
+        7 * 24 * 60 * 60 * 1000;
+
+    const visibleQuizzes = state.quizzes.filter(
+        function(quiz) {
+            const endTimestamp = parseQuizTime(
+                quiz.endTime
+            );
+
+            if (
+                endTimestamp !== null &&
+                now - endTimestamp >= QUIZ_RETENTION_MS
+            ) {
+                return false;
+            }
+
+            if (!keyword) {
+                return true;
+            }
+
+            const text = [
+                quiz.name,
+                quiz.code,
+                quiz.description
+            ].join(" ").toLowerCase();
+
+            return text.includes(keyword);
+        }
+    );
+
+    state.filteredQuizzes =
+        sortQuizzesByDeadline(visibleQuizzes);
+
+    renderQuizzes();
+
+    updateCount();
+    updateEmptyState();
+}
+
+/* ==================== SORT QUIZ BY DEADLINE ==================== */
+
+function sortQuizzesByDeadline(quizzes) {
+    function getSortInfo(quiz) {
+        const status = getQuizStatus(quiz);
+
+        if (status.type === "open") {
+            return {
+                priority: 1,
+                deadline:
+                    parseQuizTime(quiz.endTime) ?? Infinity
+            };
+        }
+
+        if (status.type === "upcoming") {
+            return {
+                priority: 2,
+                deadline:
+                    parseQuizTime(quiz.startTime) ?? Infinity
+            };
+        }
+
+        if (status.type === "closed") {
+            return {
+                priority: 3,
+                deadline:
+                    -(parseQuizTime(quiz.endTime) ?? 0)
+            };
+        }
+
+        return {
+            priority: 4,
+            deadline: Infinity
+        };
+    }
+
+    return quizzes
+        .map(function(quiz, index) {
+            const sortInfo = getSortInfo(quiz);
+
+            return {
+                quiz,
+                index,
+                priority: sortInfo.priority,
+                deadline: sortInfo.deadline
+            };
+        })
+        .sort(function(a, b) {
+            return (
+                a.priority - b.priority ||
+                a.deadline - b.deadline ||
+                a.index - b.index
+            );
+        })
+        .map(function(item) {
+            return item.quiz;
+        });
+}
+
+/* ============================ RENDER ===================== */
+
+function renderQuizzes() {
+    if (!elements.quizContainer) {
+        return;
+    }
+
+    elements.quizContainer.innerHTML = "";
+
+    if (state.filteredQuizzes.length === 0) {
+        return;
+    }
+
+    const fragment = document.createDocumentFragment();
+
+    state.filteredQuizzes.forEach(function(quiz) {
+        fragment.appendChild(createQuizCard(quiz));
+    });
+
+    elements.quizContainer.appendChild(fragment);
+
+    applyViewMode();
+}
+
+/* ======================== CREATE CARD ==================== */
+
+function createQuizCard(quiz) {
+    const card = document.createElement("article");
+
+    card.className = "quiz-card";
+    card.dataset.code = quiz.code;
+
+    const alertPhase = getQuizAlertPhase(quiz);
+
+    if (alertPhase) {
+        card.classList.add(
+            "quiz-alert-" + alertPhase
+        );
+
+        card.style.animationDelay =
+            "-" + ((Date.now() % 800) / 1000) + "s";
+    }
+
+    const status = getQuizStatus(quiz);
+
+    const top = document.createElement("div");
+    top.className = "quiz-card-top";
+
+    const icon = document.createElement("div");
+    icon.className = "quiz-icon";
+
+    icon.innerHTML =
+        '<i class="fa-solid fa-graduation-cap"></i>';
+
+    const statusBadge = document.createElement("span");
+
+    statusBadge.className =
+        "quiz-status status-" + status.type;
+
+    statusBadge.textContent = status.text;
+
+    top.appendChild(icon);
+    top.appendChild(statusBadge);
+
+    const content = document.createElement("div");
+    content.className = "quiz-content";
+
+    const title = document.createElement("h3");
+    title.className = "quiz-title";
+    title.textContent = quiz.name;
+
+    const description = document.createElement("p");
+    description.className = "quiz-description";
+
+    if (status.type === "upcoming") {
+        const startTime = parseQuizTime(
+            quiz.startTime
+        );
+
+        description.textContent =
+            "Vui lòng quay trở lại sau " +
+            formatCountdown(startTime - Date.now());
+
+    } else if (status.type === "closed") {
+        description.textContent =
+            "Phiên Quiz đã kết thúc.";
+
+    } else if (status.type === "open") {
+        description.textContent =
+            quiz.description ||
+            "Phiên Quiz đã sẵn sàng. Em có thể bắt đầu!";
+
+    } else {
+        description.textContent =
+            "Chưa xác định được thời gian mở phiên Quiz.";
+    }
+
+    content.appendChild(title);
+    content.appendChild(description);
+
+    if (status.canPlay) {
+        const codeElement = document.createElement("div");
+
+        codeElement.className = "quiz-code";
+
+        codeElement.innerHTML =
+            '<i class="fa-solid fa-hashtag"></i> ' +
+            'Mã phiên: <strong></strong>';
+
+        codeElement.querySelector("strong").textContent =
+            quiz.code;
+
+        content.appendChild(codeElement);
+    }
+
+    const footer = document.createElement("div");
+    footer.className = "quiz-card-footer";
+
+    const playButton = document.createElement("button");
+
+    playButton.type = "button";
+    playButton.className = "play-button";
+
+    if (status.canPlay) {
+        playButton.innerHTML =
+            '<i class="fa-solid fa-play"></i>' +
+            '<span>Chơi ngay</span>';
+
+        playButton.addEventListener(
+            "click",
+            function() {
+                const currentStatus = getQuizStatus(quiz);
+
+                if (!currentStatus.canPlay) {
+                    showToastMessage(
+                        currentStatus.type === "upcoming"
+                            ? "Phiên Quiz chưa đến giờ mở."
+                            : currentStatus.type === "closed"
+                                ? "Phiên Quiz đã hết thời gian."
+                                : "Không xác định được thời gian phiên Quiz."
+                    );
+
+                    filterAndRender();
+
+                    return;
+                }
+
+                openQuiz(quiz.code);
+            }
+        );
+
+    } else {
+        playButton.disabled = true;
+
+        playButton.classList.add("disabled");
+
+        playButton.innerHTML =
+            '<i class="fa-solid fa-lock"></i>' +
+            '<span></span>';
+
+        playButton.querySelector("span").textContent =
+            status.text;
+    }
+
+    footer.appendChild(playButton);
+
+    card.appendChild(top);
+    card.appendChild(content);
+    card.appendChild(footer);
+
+    return card;
+}
+
+/* =========================== OPEN QUIZ =================== */
+
+function openQuiz(code) {
+    const cleanCode = String(code || "").trim();
+
+    if (!/^\d+$/.test(cleanCode)) {
+        showToastMessage("Mã phiên không hợp lệ.");
+        return;
+    }
+
+    const target =
+        "running/index.html?code=" +
+        encodeURIComponent(cleanCode);
+
+    const newTab = window.open(target, "_blank");
+
+    if (!newTab) {
+        showToastMessage(
+            "Trình duyệt đã chặn cửa sổ mới. " +
+            "Hãy cho phép mở tab."
+        );
+
+        return;
+    }
+
+    try {
+        newTab.opener = null;
+    } catch (error) {
+        // Không ảnh hưởng đến việc mở phiên Quiz.
+    }
+}
+
+/* ========================== VIEW MODE ==================== */
+
+function loadSavedViewMode() {
+    try {
+        return localStorage.getItem(CONFIG.STORAGE_VIEW) === "list"
+            ? "list"
+            : "grid";
+    } catch (error) {
+        return "grid";
+    }
+}
+
+function setViewMode(mode) {
+    if (mode !== "grid" && mode !== "list") {
+        return;
+    }
+
+    state.viewMode = mode;
+
+    try {
+        localStorage.setItem(
+            CONFIG.STORAGE_VIEW,
+            mode
+        );
+    } catch (error) {
+        console.warn(
+            "Không thể lưu chế độ xem:",
+            error
+        );
+    }
+
+    applyViewMode();
+}
+
+function applyViewMode() {
+    if (!elements.quizContainer) {
+        return;
+    }
+
+    elements.quizContainer.classList.toggle(
+        "list-view",
+        state.viewMode === "list"
+    );
+
+    if (elements.gridViewButton) {
+        elements.gridViewButton.classList.toggle(
+            "active",
+            state.viewMode === "grid"
+        );
+    }
+
+    if (elements.listViewButton) {
+        elements.listViewButton.classList.toggle(
+            "active",
+            state.viewMode === "list"
+        );
+    }
+}
+
+/* ============================ SEARCH ===================== */
+
+function clearSearch() {
+    state.searchText = "";
+
+    if (elements.searchInput) {
+        elements.searchInput.value = "";
+    }
+
+    updateSearchButton();
+    filterAndRender();
+}
+
+function updateSearchButton() {
+    if (elements.clearSearch) {
+        elements.clearSearch.classList.toggle(
+            "hidden",
+            !state.searchText
+        );
+    }
+}
+
+/* ============================ COUNT ====================== */
+
+function updateCount() {
+    if (!elements.quizCount) {
+        return;
+    }
+
+    const total = state.quizzes.length;
+    const visible = state.filteredQuizzes.length;
+
+    elements.quizCount.textContent =
+        state.searchText
+            ? visible + " / " + total + " phiên"
+            : total + " phiên";
+}
+
+/* ========================= EMPTY STATE =================== */
+
+function updateEmptyState() {
+    if (!state.quizzes.length) {
+        showEmpty(
+            "Hiện chưa có phiên Quiz nào được mở."
+        );
+
+        return;
+    }
+
+    if (!state.filteredQuizzes.length) {
+        showEmpty(
+            "Không tìm thấy phiên Quiz phù hợp."
+        );
+
+        return;
+    }
+
+    hideEmpty();
+}
+
+/* ============================ STATES ===================== */
+
+function showLoading() {
+    if (elements.loadingState) {
+        elements.loadingState.classList.remove("hidden");
+    }
+
+    hideError();
+    hideEmpty();
+}
+
+function hideLoading() {
+    if (elements.loadingState) {
+        elements.loadingState.classList.add("hidden");
+    }
+}
+
+function showEmpty(message) {
+    hideLoading();
+    hideError();
+
+    if (elements.emptyMessage) {
+        elements.emptyMessage.textContent = message;
+    }
+
+    if (elements.emptyState) {
+        elements.emptyState.classList.remove("hidden");
+    }
+}
+
+function hideEmpty() {
+    if (elements.emptyState) {
+        elements.emptyState.classList.add("hidden");
+    }
+}
+
+/* ============================== ERROR =================== */
+
+function showError(message) {
+    if (elements.errorMessage) {
+        elements.errorMessage.textContent =
+            message || "Không thể tải dữ liệu.";
+    }
+
+    if (elements.errorState) {
+        elements.errorState.classList.remove("hidden");
+    }
+
+    showDeviceIdInError();
+
+    if (elements.quizContainer) {
+        elements.quizContainer.innerHTML = "";
+    }
+
+    if (elements.emptyState) {
+        elements.emptyState.classList.add("hidden");
+    }
+}
+
+function showDeviceIdInError() {
+    if (!elements.errorState) {
+        return;
+    }
+
+    let deviceIdLine =
+        document.getElementById("deviceIdErrorLine");
+
+    if (!deviceIdLine) {
+        deviceIdLine = document.createElement("div");
+
+        deviceIdLine.id = "deviceIdErrorLine";
+
+        Object.assign(deviceIdLine.style, {
+            display: "block",
+            marginTop: "8px",
+            fontSize: "13px",
+            lineHeight: "1.6",
+            color: "#64748b",
+            overflowWrap: "anywhere",
+            userSelect: "text"
+        });
+
+        if (
+            elements.errorMessage &&
+            elements.errorMessage.parentNode
+        ) {
+            elements.errorMessage.insertAdjacentElement(
+                "afterend",
+                deviceIdLine
+            );
+
+        } else {
+            elements.errorState.appendChild(deviceIdLine);
+        }
+    }
+
+    let deviceId = "";
+
+    try {
+        deviceId = String(
+            localStorage.getItem(
+                CONFIG.STORAGE_DEVICE_ID
+            ) || ""
+        ).trim();
+
+    } catch (error) {
+        console.warn(
+            "Không thể đọc ID thiết bị:",
+            error
+        );
+    }
+
+    deviceIdLine.textContent = deviceId
+        ? "ID thiết bị: " + deviceId
+        : "ID thiết bị: Chưa có hoặc chưa lưu được";
+}
+
+function hideError() {
+    if (elements.errorState) {
+        elements.errorState.classList.add("hidden");
+    }
+}
+
+/* ======================= ERROR MESSAGE =================== */
+
+function getErrorMessage(error) {
+    if (error?.name === "AbortError") {
+        return "API không phản hồi. Vui lòng thử lại.";
+    }
+
+    const deviceErrorCodes = [
+        "DEVICE_LOCKED",
+        "DEVICE_UNREGISTERED",
+        "DEVICE_NOT_FOUND",
+        "DEVICE_ID_MISSING",
+        "DEVICE_EXPIRED",
+        "TOKEN_INVALID",
+        "TOKEN_MISSING",
+        "DEVICE_TOKEN_MISSING",
+        "IP_NOT_FOUND",
+        "IP_MISSING"
+    ];
+
+    if (deviceErrorCodes.includes(error?.code)) {
+        return error.message;
+    }
+
+    return (
+        error?.message ||
+        "Không thể kết nối tới API."
+    );
+}
+
+/* ======================== REFRESH BUTTON ================ */
+
+function setRefreshLoading(loading) {
+    if (elements.refreshButton) {
+        elements.refreshButton.disabled = loading;
+
+        const icon =
+            elements.refreshButton.querySelector("i");
+
+        if (icon) {
+            icon.classList.toggle("fa-spin", loading);
+        }
+    }
+
+    if (elements.retryButton) {
+        elements.retryButton.disabled = loading;
+    }
+}
+
+/* ============================== TOAST ==================== */
+
+let toastTimer = null;
+
+function showToastMessage(message) {
+    if (
+        !elements.toast ||
+        !elements.toastMessage
+    ) {
+        return;
+    }
+
+    elements.toastMessage.textContent = message;
+
+    elements.toast.classList.add("show");
+
+    clearTimeout(toastTimer);
+
+    toastTimer = setTimeout(function() {
+        elements.toast.classList.remove("show");
+    }, 3000);
+}
+
+/* ============================ KEYBOARD ================== */
+
+function handleKeyboard(event) {
+    if (
+        (event.ctrlKey || event.metaKey) &&
+        event.key.toLowerCase() === "k"
+    ) {
+        event.preventDefault();
+
+        if (elements.searchInput) {
+            elements.searchInput.focus();
+        }
+    }
+
+    if (
+        event.key === "Escape" &&
+        state.searchText
+    ) {
+        clearSearch();
+    }
+}
+
+/* ===================== AUTO UPDATE STATUS ================ */
+
+/*
+ * Cập nhật trạng thái mỗi giây.
+ * Không gọi API mỗi giây.
+ *
+ * - Cập nhật trạng thái mở/đóng.
+ * - Tự động sắp xếp lại theo thời hạn.
+ * - Khóa nút chơi khi phiên Quiz hết giờ.
+ * - Ẩn phiên Quiz hết hạn đủ 7 ngày.
+ */
+
+setInterval(function() {
+    if (
+        !state.loading &&
+        state.quizzes.length > 0
+    ) {
+        filterAndRender();
+    }
+}, 1000);
