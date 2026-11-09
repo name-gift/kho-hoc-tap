@@ -194,87 +194,46 @@ function isRetryableHttpStatus(status) {
 
 /* ======================== FETCH RETRY ==================== */
 
-async function fetchJsonWithRetry(
-    url,
-    options = {},
-    signal = null,
-    requestName = "API"
-) {
-    const maxAttempts = Math.max(
-        1,
-        Number(CONFIG.API_RETRY_ATTEMPTS) || 4
-    );
+
+async function fetchJsonWithRetry(url, options = {}, signal) {
+    const MAX_ATTEMPTS = 4;
+    const RETRY_DELAYS = [800, 1600, 3000];
 
     let lastError = null;
 
-    for (
-        let attempt = 1;
-        attempt <= maxAttempts;
-        attempt++
-    ) {
-        if (signal?.aborted) {
-            throw createApiError(
-                "Yêu cầu đã bị hủy."
-            );
-        }
-
-        const controller = new AbortController();
-
-        let timeout = null;
-        let externalAbortHandler = null;
-        let timedOut = false;
-
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-            if (signal) {
-                externalAbortHandler = function() {
-                    controller.abort();
-                };
+            const response = await fetch(url, {
+                ...options,
+                signal
+            });
 
-                signal.addEventListener(
-                    "abort",
-                    externalAbortHandler,
-                    { once: true }
-                );
-            }
-
-            timeout = setTimeout(function() {
-                timedOut = true;
-                controller.abort();
-            }, CONFIG.API_TIMEOUT);
-
-            const response = await fetch(
-                url,
-                {
-                    ...options,
-                    signal: controller.signal
-                }
-            );
-
-            if (isRetryableHttpStatus(response.status)) {
-                throw Object.assign(
-                    new Error(
-                        "API tạm thời không phản hồi. HTTP " +
-                        response.status
-                    ),
-                    {
-                        retryable: true,
-                        status: response.status
-                    }
-                );
-            }
+            const text = await response.text();
 
             let data;
 
             try {
-                data = await response.json();
-
-            } catch (error) {
+                data = text ? JSON.parse(text) : {};
+            } catch {
                 throw Object.assign(
-                    createApiError(
-                        "API không trả về JSON hợp lệ."
-                    ),
+                    new Error("Phản hồi API không hợp lệ."),
+                    { retryable: true }
+                );
+            }
+
+            // Worker trả về { success: false } thì thử kết nối lại.
+            if (
+                data &&
+                typeof data === "object" &&
+                !Array.isArray(data) &&
+                data.success === false &&
+                Object.keys(data).length === 1
+            ) {
+                throw Object.assign(
+                    new Error("Failed to fetch"),
                     {
-                        retryable: true
+                        retryable: true,
+                        workerBlocked: true
                     }
                 );
             }
@@ -282,80 +241,56 @@ async function fetchJsonWithRetry(
             return {
                 response,
                 data,
-                code: getErrorCode(data)
+                code: data?.code || data?.error || null
             };
 
         } catch (error) {
             if (signal?.aborted) {
-                throw createApiError(
-                    "Yêu cầu đã bị hủy."
-                );
-            }
-
-            const isTimeout =
-                timedOut ||
-                error?.name === "TimeoutError";
-
-            const isNetworkError =
-                error?.name === "TypeError" ||
-                error?.name === "AbortError" ||
-                error?.retryable === true ||
-                isTimeout;
-
-            if (!isNetworkError) {
                 throw error;
             }
 
             lastError = error;
 
-            if (attempt >= maxAttempts) {
-                console.error(
-                    requestName + " thất bại sau " +
-                    (maxAttempts - 1) + " lần thử lại.",
-                    lastError
-                );
+            const shouldRetry =
+                error?.retryable === true ||
+                error?.name === "TypeError";
 
-                throw createApiError(
-                    "Failed to fetch",
-                    "API_CONNECTION_FAILED"
-                );
+            if (!shouldRetry) {
+                throw error;
             }
 
-        } finally {
-            if (timeout !== null) {
-                clearTimeout(timeout);
+            // Đã hết 4 lần gọi API.
+            if (attempt === MAX_ATTEMPTS) {
+                break;
             }
 
-            if (
-                signal &&
-                externalAbortHandler
-            ) {
-                signal.removeEventListener(
-                    "abort",
-                    externalAbortHandler
-                );
+            const retryNumber = attempt;
+
+            const message =
+                "Mất kết nối! Đang thử lại lần " +
+                retryNumber +
+                "/3...";
+
+            if (typeof showDeviceLoading === "function") {
+                showDeviceLoading(message);
             }
+
+            if (typeof updateDeviceLoadingMessage === "function") {
+                updateDeviceLoadingMessage(message);
+            }
+
+            // Chờ lần lượt 800ms, 1600ms, 3000ms.
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(resolve, RETRY_DELAYS[attempt - 1]);
+
+                if (signal) {
+                    signal.addEventListener("abort", () => {
+                        clearTimeout(timer);
+                        reject(signal.reason || new Error("Aborted"));
+                    }, { once: true });
+                }
+            });
         }
-
-        const delay =
-            CONFIG.API_RETRY_DELAYS[attempt - 1] || 3000;
-
-        const nextRetry = attempt;
-
-        const message =
-            "Mất kết nối! Đang thử lại lần " +
-            nextRetry +
-            "/3...";
-
-        console.warn(
-            message,
-            lastError
-        );
-
-        showDeviceLoading();
-        updateDeviceLoadingMessage(message);
-
-        await sleep(delay, signal);
     }
 
     throw createApiError(
