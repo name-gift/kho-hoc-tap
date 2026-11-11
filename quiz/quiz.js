@@ -56,6 +56,7 @@ function createApiError(message, code = "", status = 0) {
     return error;
 }
 
+
 function getErrorCode(result) {
     return String(
         result?.code ||
@@ -65,6 +66,7 @@ function getErrorCode(result) {
         ""
     ).trim().toUpperCase();
 }
+
 
 /* ======================== DEVICE INFO ==================== */
 
@@ -194,8 +196,6 @@ function isRetryableHttpStatus(status) {
 
 /* ======================== FETCH RETRY ==================== */
 
-
-
 async function fetchJsonWithRetry(
     url,
     options = {},
@@ -209,10 +209,48 @@ async function fetchJsonWithRetry(
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
         try {
-            const response = await fetch(url, {
-                ...options,
-                signal
-            });
+            const controller = new AbortController();
+
+            let timeoutId = null;
+
+            const handleAbort = () => {
+                controller.abort();
+            };
+
+            if (signal?.aborted) {
+                throw createApiError("Yêu cầu đã bị hủy.");
+            }
+
+            if (signal) {
+                signal.addEventListener(
+                    "abort",
+                    handleAbort,
+                    { once: true }
+                );
+            }
+
+            timeoutId = setTimeout(() => {
+                controller.abort();
+            }, CONFIG.API_TIMEOUT);
+
+            let response;
+
+            try {
+                response = await fetch(url, {
+                    ...options,
+                    signal: controller.signal
+                });
+
+            } finally {
+                clearTimeout(timeoutId);
+
+                if (signal) {
+                    signal.removeEventListener(
+                        "abort",
+                        handleAbort
+                    );
+                }
+            }
 
             const text = await response.text();
 
@@ -228,10 +266,19 @@ async function fetchJsonWithRetry(
             }
 
             /*
-             * Chỉ retry { success: false } ở các API khác.
-             * Riêng /check phải trả lỗi ngay để hiển thị
-             * thông báo API từ chối yêu cầu.
+             * Chỉ retry khi Worker trả đúng:
+             * { "success": false }
+             *
+             * Không retry /check.
+             *
+             * Nếu Worker trả code cụ thể như:
+             * WORKER_TIME_BLOCKED
+             * DEVICE_LOCKED
+             * DEVICE_EXPIRED
+             *
+             * thì trả lỗi ngay, không retry.
              */
+
             if (
                 requestPath !== "/check" &&
                 data &&
@@ -252,7 +299,7 @@ async function fetchJsonWithRetry(
             return {
                 response,
                 data,
-                code: data?.code || data?.error || null
+                code: getErrorCode(data)
             };
 
         } catch (error) {
@@ -264,7 +311,8 @@ async function fetchJsonWithRetry(
 
             const shouldRetry =
                 error?.retryable === true ||
-                error?.name === "TypeError";
+                error?.name === "TypeError" ||
+                error?.name === "AbortError";
 
             if (!shouldRetry) {
                 throw error;
@@ -285,28 +333,10 @@ async function fetchJsonWithRetry(
 
             updateDeviceLoadingMessage(message);
 
-            await new Promise((resolve, reject) => {
-                const timer = setTimeout(
-                    resolve,
-                    RETRY_DELAYS[attempt - 1]
-                );
-
-                if (signal) {
-                    const handleAbort = () => {
-                        clearTimeout(timer);
-                        reject(
-                            signal.reason ||
-                            new Error("Aborted")
-                        );
-                    };
-
-                    signal.addEventListener(
-                        "abort",
-                        handleAbort,
-                        { once: true }
-                    );
-                }
-            });
+            await sleep(
+                RETRY_DELAYS[attempt - 1],
+                signal
+            );
         }
     }
 
@@ -317,6 +347,7 @@ async function fetchJsonWithRetry(
 }
 
 /* ======================= API REQUEST ===================== */
+
 
 async function ensureDeviceRegistered(signal) {
     const credentials = getDeviceCredentials();
@@ -337,7 +368,6 @@ async function ensureDeviceRegistered(signal) {
                 CONFIG.STORAGE_DEVICE_ID,
                 deviceId
             );
-
         } catch (error) {
             throw createApiError(
                 "Trình duyệt không cho phép lưu thông tin thiết bị."
@@ -363,8 +393,7 @@ async function ensureDeviceRegistered(signal) {
         );
 
         /*
-         * CHECK chỉ gửi deviceId.
-         * Không gửi deviceToken.
+         * /check tuyệt đối không gửi deviceToken.
          */
 
         if (
@@ -420,12 +449,17 @@ async function ensureDeviceRegistered(signal) {
     }
 
     function throwWorkerError(result, fallback) {
+        const data = result?.data || {};
+
         throw createApiError(
-            result.data?.message ||
-            result.data?.error_description ||
-            fallback,
-            result.code,
-            result.response?.status || 0
+            data.message ||
+            data.error_description ||
+            fallback ||
+            "API từ chối yêu cầu.",
+
+            getErrorCode(data),
+
+            result?.response?.status || 0
         );
     }
 
@@ -522,27 +556,23 @@ async function ensureDeviceRegistered(signal) {
         "Đang xác minh thiết bị..."
     );
 
-   const check = await callWorker("/check");
+    const check = await callWorker("/check");
 
-/*
- * WORKER TỪ CHỐI YÊU CẦU CHECK
- *
- * Không đăng ký lại.
- * Không gia hạn.
- * Không chuyển thành Failed to fetch.
- * Dừng xác thực và hiển thị lỗi riêng.
- */
+    const checkCode = getErrorCode(check.data);
 
-if (check.data?.success === false) {
-    throw createApiError(
-        "API từ chối yêu cầu.",
-        "API_CHECK_FAILED",
-        check.response?.status || 0
-    );
-}
+    /*
+     * ƯU TIÊN XỬ LÝ LỖI CỤ THỂ
+     */
+
+    if (checkCode === "WORKER_TIME_BLOCKED") {
+        throwWorkerError(
+            check,
+            "API Quiz tạm thời không hoạt động trong khung giờ quy định."
+        );
+    }
 
     if (
-        check.code === "DEVICE_LOCKED" ||
+        checkCode === "DEVICE_LOCKED" ||
         check.data?.locked === true
     ) {
         throwWorkerError(
@@ -551,48 +581,76 @@ if (check.data?.success === false) {
         );
     }
 
-    const checkStatus = String(
-        check.data?.status || ""
-    ).trim().toLowerCase();
-
-    if (
-        check.response.ok &&
-        check.data?.success === true &&
-        checkStatus === "active"
-    ) {
-        saveReturnedDeviceId(check.data);
-
-        const hasToken = saveReturnedToken(check.data);
-
-        if (!hasToken || !deviceToken) {
-            throw createApiError(
-                "Worker không trả về deviceToken hợp lệ.",
-                "TOKEN_MISSING"
-            );
-        }
-
-        return finishDeviceAuthentication();
-    }
+    /*
+     * Các lỗi được phép tiếp tục sang REGISTER hoặc RENEW.
+     */
 
     const deviceExpired =
-        check.code === "DEVICE_EXPIRED" ||
-        check.data?.error === "DEVICE_EXPIRED";
+        checkCode === "DEVICE_EXPIRED";
 
     const deviceNotRegistered = [
         "DEVICE_UNREGISTERED",
         "DEVICE_NOT_FOUND"
-    ].includes(check.code);
+    ].includes(checkCode);
+
+    const knownCheckErrors = [
+        "DEVICE_EXPIRED",
+        "DEVICE_UNREGISTERED",
+        "DEVICE_NOT_FOUND"
+    ];
+
+    /*
+     * Nếu API trả success:false nhưng không thuộc
+     * nhóm lỗi thiết bị đã biết thì dừng ngay.
+     *
+     * Không tự động đăng ký lại.
+     */
+
+    if (check.data?.success === false) {
+        if (!knownCheckErrors.includes(checkCode)) {
+            throwWorkerError(
+                check,
+                "API không thể xác minh thiết bị."
+            );
+        }
+    }
+
+    /*
+     * Nếu HTTP thất bại nhưng không có mã lỗi
+     * hợp lệ để đăng ký hoặc gia hạn thì dừng.
+     */
+
+    if (
+        !check.response.ok &&
+        !deviceExpired &&
+        !deviceNotRegistered
+    ) {
+        throwWorkerError(
+            check,
+            "Không thể xác minh thiết bị."
+        );
+    }
 
     /* ================= BƯỚC 2: RENEW ================= */
+
+    const checkStatus = String(
+        check.data?.status || ""
+    ).trim().toLowerCase();
 
     const checkNeedsRenew =
         check.response.ok &&
         check.data?.success === true &&
-        (
-            checkStatus === "active" ||
-            checkStatus === "registered" ||
-            checkStatus === "valid"
-        );
+        [
+            "active",
+            "registered",
+            "valid"
+        ].includes(checkStatus);
+
+    /*
+     * Theo quy trình:
+     * - Thiết bị active/registered/valid: RENEW.
+     * - Thiết bị hết hạn: RENEW.
+     */
 
     if (deviceExpired || checkNeedsRenew) {
         updateDeviceLoadingMessage(
@@ -601,8 +659,17 @@ if (check.data?.success === false) {
 
         const renew = await callWorker("/renew");
 
+        const renewCode = getErrorCode(renew.data);
+
+        if (renewCode === "WORKER_TIME_BLOCKED") {
+            throwWorkerError(
+                renew,
+                "API Quiz tạm thời không hoạt động trong khung giờ quy định."
+            );
+        }
+
         if (
-            renew.code === "DEVICE_LOCKED" ||
+            renewCode === "DEVICE_LOCKED" ||
             renew.data?.locked === true
         ) {
             throwWorkerError(
@@ -611,14 +678,17 @@ if (check.data?.success === false) {
             );
         }
 
-        const notExpired =
-            renew.code === "DEVICE_NOT_EXPIRED";
+        /*
+         * DEVICE_NOT_EXPIRED:
+         * Không xem là thành công nếu Worker không cấp token.
+         * Trường hợp này cần kiểm tra lại token được trả về.
+         */
 
         const renewSuccess =
             renew.response.ok &&
             renew.data?.success === true;
 
-        if (!renewSuccess && !notExpired) {
+        if (!renewSuccess) {
             throwWorkerError(
                 renew,
                 "Không thể gia hạn hoặc xác minh thiết bị."
@@ -648,6 +718,27 @@ if (check.data?.success === false) {
 
         const registration = await callWorker("/register");
 
+        const registerCode = getErrorCode(
+            registration.data
+        );
+
+        if (registerCode === "WORKER_TIME_BLOCKED") {
+            throwWorkerError(
+                registration,
+                "API Quiz tạm thời không hoạt động trong khung giờ quy định."
+            );
+        }
+
+        if (
+            registerCode === "DEVICE_LOCKED" ||
+            registration.data?.locked === true
+        ) {
+            throwWorkerError(
+                registration,
+                "Thiết bị đã bị khóa và không được phép truy cập."
+            );
+        }
+
         if (
             !registration.response.ok ||
             registration.data?.success !== true
@@ -660,7 +751,9 @@ if (check.data?.success === false) {
 
         saveReturnedDeviceId(registration.data);
 
-        const hasToken = saveReturnedToken(registration.data);
+        const hasToken = saveReturnedToken(
+            registration.data
+        );
 
         if (!hasToken || !deviceToken) {
             throw createApiError(
@@ -1197,61 +1290,15 @@ async function loadQuizzes(showToast = false) {
             );
         }
 
+    
     } catch (error) {
         console.error("QUIZ API ERROR:", error);
 
-        // API từ chối yêu cầu kiểm tra thiết bị
-if (error?.code === "API_CHECK_FAILED") {
-    clearQuizPageAfterFailure();
-
-    // Hiển thị tiêu đề lỗi.
-    let errorTitle = elements.errorState?.querySelector(
-        "[data-error-title], #errorTitle, .error-title, h2, h3"
-    );
-
-    // Nếu HTML chưa có tiêu đề thì tự tạo.
-    if (!errorTitle && elements.errorState) {
-        errorTitle = document.createElement("h2");
-        errorTitle.id = "errorTitle";
-
-        errorTitle.style.marginBottom = "10px";
-
-        if (elements.errorMessage) {
-            elements.errorMessage.insertAdjacentElement(
-                "beforebegin",
-                errorTitle
-            );
-        } else {
-            elements.errorState.prepend(errorTitle);
-        }
-    }
-
-    if (errorTitle) {
-        errorTitle.textContent = "Không thể kiểm tra Quiz";
-    }
-
-    // Hiển thị nội dung lỗi.
-    if (elements.errorMessage) {
-        elements.errorMessage.textContent =
-            "API từ chối yêu cầu.";
-    }
-
-    if (elements.errorState) {
-        elements.errorState.classList.remove("hidden");
-    }
-
-    showDeviceIdInError();
-
-    return;
-}
-
         /*
-         * API KHÔNG KẾT NỐI ĐƯỢC:
-         * Sau lần đầu + 3 lần thử lại,
-         * chỉ hiển thị trang lỗi Failed to fetch.
+         * MẤT KẾT NỐI API
          *
-         * Kiểm tra cả code và message để tránh
-         * trường hợp lỗi bị chuyển đổi ở một bước khác.
+         * Sau lần đầu + 3 lần thử lại,
+         * thay thế toàn bộ trang bằng Failed to fetch.
          */
 
         if (
@@ -1263,7 +1310,8 @@ if (error?.code === "API_CHECK_FAILED") {
         }
 
         /*
-         * Các lỗi khác vẫn xử lý như cũ.
+         * Các lỗi Worker trả về được hiển thị
+         * bằng message cụ thể.
          */
 
         clearQuizPageAfterFailure();
@@ -2212,26 +2260,71 @@ function hideError() {
 
 /* ======================= ERROR MESSAGE =================== */
 
+
 function getErrorMessage(error) {
-    if (error?.name === "AbortError") {
-        return "API không phản hồi. Vui lòng thử lại.";
+    const code = String(
+        error?.code || ""
+    ).trim().toUpperCase();
+
+    const messages = {
+        WORKER_TIME_BLOCKED:
+            "API Quiz tạm thời không hoạt động.",
+
+        DEVICE_LOCKED:
+            "Thiết bị đã bị khóa và không được phép truy cập.",
+
+        DEVICE_UNREGISTERED:
+            "Thiết bị chưa được đăng ký.",
+
+        DEVICE_NOT_FOUND:
+            "Không tìm thấy thiết bị.",
+
+        DEVICE_EXPIRED:
+            "Thiết bị đã hết hạn xác thực.",
+
+        DEVICE_ID_MISSING:
+            "Thiếu mã thiết bị.",
+
+        INVALID_DEVICE_ID:
+            "Mã thiết bị không hợp lệ.",
+
+        TOKEN_INVALID:
+            "Token thiết bị không hợp lệ.",
+
+        TOKEN_MISSING:
+            "Thiếu token xác thực thiết bị.",
+
+        DEVICE_TOKEN_MISSING:
+            "Worker không nhận được token thiết bị.",
+
+        IP_MISSING:
+            "Không lấy được địa chỉ IP của thiết bị.",
+
+        IP_NOT_FOUND:
+            "Không tìm thấy địa chỉ IP.",
+
+        API_TIMEOUT:
+            "Kết nối API quá thời gian chờ.",
+
+        API_CONNECTION_ERROR:
+            "Không thể kết nối đến máy chủ API.",
+
+        INVALID_API_RESPONSE:
+            "Máy chủ API trả về dữ liệu không hợp lệ.",
+
+        ACCESS_DENIED:
+            "Truy cập API bị từ chối.",
+
+        WORKER_ERROR:
+            "Worker xảy ra lỗi trong quá trình xử lý."
+    };
+
+    if (messages[code]) {
+        return messages[code];
     }
 
-    const deviceErrorCodes = [
-        "DEVICE_LOCKED",
-        "DEVICE_UNREGISTERED",
-        "DEVICE_NOT_FOUND",
-        "DEVICE_ID_MISSING",
-        "DEVICE_EXPIRED",
-        "TOKEN_INVALID",
-        "TOKEN_MISSING",
-        "DEVICE_TOKEN_MISSING",
-        "IP_NOT_FOUND",
-        "IP_MISSING"
-    ];
-
-    if (deviceErrorCodes.includes(error?.code)) {
-        return error.message;
+    if (error?.name === "AbortError") {
+        return "API không phản hồi. Vui lòng thử lại.";
     }
 
     return (
@@ -2239,6 +2332,7 @@ function getErrorMessage(error) {
         "Không thể kết nối tới API."
     );
 }
+
 
 /* ======================== REFRESH BUTTON ================ */
 
