@@ -1,3 +1,4 @@
+
 "use strict";
 
 /* ======================== CONFIG ======================== */
@@ -505,6 +506,18 @@ async function ensureDeviceRegistered(signal) {
     );
 
     const check = await callWorker("/check");
+
+    // CHECK trả về success: false
+if (
+    check.data &&
+    check.data.success === false
+) {
+    throw createApiError(
+        "API từ chối yêu cầu.",
+        getErrorCode(check.data) || "API_CHECK_FAILED",
+        check.response?.status || 0
+    );
+}
 
     if (
         check.code === "DEVICE_LOCKED" ||
@@ -1164,6 +1177,24 @@ async function loadQuizzes(showToast = false) {
 
     } catch (error) {
         console.error("QUIZ API ERROR:", error);
+
+        // API từ chối yêu cầu kiểm tra thiết bị
+if (error?.code === "API_CHECK_FAILED") {
+    clearQuizPageAfterFailure();
+
+    if (elements.errorMessage) {
+        elements.errorMessage.textContent =
+            "API từ chối yêu cầu.";
+    }
+
+    if (elements.errorState) {
+        elements.errorState.classList.remove("hidden");
+    }
+
+    showDeviceIdInError();
+
+    return;
+}
 
         /*
          * API KHÔNG KẾT NỐI ĐƯỢC:
