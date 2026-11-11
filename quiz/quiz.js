@@ -195,9 +195,15 @@ function isRetryableHttpStatus(status) {
 /* ======================== FETCH RETRY ==================== */
 
 
-async function fetchJsonWithRetry(url, options = {}, signal) {
-    const MAX_ATTEMPTS = 4;
-    const RETRY_DELAYS = [800, 1600, 3000];
+
+async function fetchJsonWithRetry(
+    url,
+    options = {},
+    signal,
+    requestPath = ""
+) {
+    const MAX_ATTEMPTS = CONFIG.API_RETRY_ATTEMPTS;
+    const RETRY_DELAYS = CONFIG.API_RETRY_DELAYS;
 
     let lastError = null;
 
@@ -221,8 +227,13 @@ async function fetchJsonWithRetry(url, options = {}, signal) {
                 );
             }
 
-            // Worker trả về { success: false } thì thử kết nối lại.
+            /*
+             * Chỉ retry { success: false } ở các API khác.
+             * Riêng /check phải trả lỗi ngay để hiển thị
+             * thông báo API từ chối yêu cầu.
+             */
             if (
+                requestPath !== "/check" &&
                 data &&
                 typeof data === "object" &&
                 !Array.isArray(data) &&
@@ -259,35 +270,41 @@ async function fetchJsonWithRetry(url, options = {}, signal) {
                 throw error;
             }
 
-            // Đã hết 4 lần gọi API.
             if (attempt === MAX_ATTEMPTS) {
                 break;
             }
 
-            const retryNumber = attempt;
-
             const message =
                 "Mất kết nối! Đang thử lại lần " +
-                retryNumber +
+                attempt +
                 "/3...";
 
             if (typeof showDeviceLoading === "function") {
                 showDeviceLoading(message);
             }
 
-            if (typeof updateDeviceLoadingMessage === "function") {
-                updateDeviceLoadingMessage(message);
-            }
+            updateDeviceLoadingMessage(message);
 
-            // Chờ lần lượt 800ms, 1600ms, 3000ms.
             await new Promise((resolve, reject) => {
-                const timer = setTimeout(resolve, RETRY_DELAYS[attempt - 1]);
+                const timer = setTimeout(
+                    resolve,
+                    RETRY_DELAYS[attempt - 1]
+                );
 
                 if (signal) {
-                    signal.addEventListener("abort", () => {
+                    const handleAbort = () => {
                         clearTimeout(timer);
-                        reject(signal.reason || new Error("Aborted"));
-                    }, { once: true });
+                        reject(
+                            signal.reason ||
+                            new Error("Aborted")
+                        );
+                    };
+
+                    signal.addEventListener(
+                        "abort",
+                        handleAbort,
+                        { once: true }
+                    );
                 }
             });
         }
@@ -505,16 +522,21 @@ async function ensureDeviceRegistered(signal) {
         "Đang xác minh thiết bị..."
     );
 
-    const check = await callWorker("/check");
+   const check = await callWorker("/check");
 
-    // CHECK trả về success: false
-if (
-    check.data &&
-    check.data.success === false
-) {
+/*
+ * WORKER TỪ CHỐI YÊU CẦU CHECK
+ *
+ * Không đăng ký lại.
+ * Không gia hạn.
+ * Không chuyển thành Failed to fetch.
+ * Dừng xác thực và hiển thị lỗi riêng.
+ */
+
+if (check.data?.success === false) {
     throw createApiError(
         "API từ chối yêu cầu.",
-        getErrorCode(check.data) || "API_CHECK_FAILED",
+        "API_CHECK_FAILED",
         check.response?.status || 0
     );
 }
@@ -1182,6 +1204,33 @@ async function loadQuizzes(showToast = false) {
 if (error?.code === "API_CHECK_FAILED") {
     clearQuizPageAfterFailure();
 
+    // Hiển thị tiêu đề lỗi.
+    let errorTitle = elements.errorState?.querySelector(
+        "[data-error-title], #errorTitle, .error-title, h2, h3"
+    );
+
+    // Nếu HTML chưa có tiêu đề thì tự tạo.
+    if (!errorTitle && elements.errorState) {
+        errorTitle = document.createElement("h2");
+        errorTitle.id = "errorTitle";
+
+        errorTitle.style.marginBottom = "10px";
+
+        if (elements.errorMessage) {
+            elements.errorMessage.insertAdjacentElement(
+                "beforebegin",
+                errorTitle
+            );
+        } else {
+            elements.errorState.prepend(errorTitle);
+        }
+    }
+
+    if (errorTitle) {
+        errorTitle.textContent = "Không thể kiểm tra Quiz";
+    }
+
+    // Hiển thị nội dung lỗi.
     if (elements.errorMessage) {
         elements.errorMessage.textContent =
             "API từ chối yêu cầu.";
