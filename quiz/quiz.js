@@ -348,7 +348,6 @@ async function fetchJsonWithRetry(
 
 /* ======================= API REQUEST ===================== */
 
-
 async function ensureDeviceRegistered(signal) {
     const credentials = getDeviceCredentials();
 
@@ -387,15 +386,9 @@ async function ensureDeviceRegistered(signal) {
             apiBase + "/" + cleanPath
         );
 
-        url.searchParams.set(
-            "deviceId",
-            deviceId
-        );
+        url.searchParams.set("deviceId", deviceId);
 
-        /*
-         * /check tuyệt đối không gửi deviceToken.
-         */
-
+        // /check tuyệt đối không gửi deviceToken.
         if (
             normalizedPath !== "/check" &&
             deviceToken
@@ -456,9 +449,7 @@ async function ensureDeviceRegistered(signal) {
             data.error_description ||
             fallback ||
             "API từ chối yêu cầu.",
-
             getErrorCode(data),
-
             result?.response?.status || 0
         );
     }
@@ -488,7 +479,6 @@ async function ensureDeviceRegistered(signal) {
             deviceId = newDeviceId;
 
             return true;
-
         } catch (error) {
             throw createApiError(
                 "Không thể lưu deviceId vào trình duyệt."
@@ -524,7 +514,6 @@ async function ensureDeviceRegistered(signal) {
             deviceToken = newToken;
 
             return true;
-
         } catch (error) {
             throw createApiError(
                 "Đã nhận token mới nhưng không thể lưu vào trình duyệt."
@@ -560,10 +549,7 @@ async function ensureDeviceRegistered(signal) {
 
     const checkCode = getErrorCode(check.data);
 
-    /*
-     * ƯU TIÊN XỬ LÝ LỖI CỤ THỂ
-     */
-
+    // Ưu tiên lỗi khung giờ hoạt động.
     if (checkCode === "WORKER_TIME_BLOCKED") {
         throwWorkerError(
             check,
@@ -571,6 +557,7 @@ async function ensureDeviceRegistered(signal) {
         );
     }
 
+    // Thiết bị bị khóa.
     if (
         checkCode === "DEVICE_LOCKED" ||
         check.data?.locked === true
@@ -581,9 +568,7 @@ async function ensureDeviceRegistered(signal) {
         );
     }
 
-    /*
-     * Các lỗi được phép tiếp tục sang REGISTER hoặc RENEW.
-     */
+    /* ================= BƯỚC 2: PHÂN LOẠI CHECK ================= */
 
     const deviceExpired =
         checkCode === "DEVICE_EXPIRED";
@@ -593,21 +578,10 @@ async function ensureDeviceRegistered(signal) {
         "DEVICE_NOT_FOUND"
     ].includes(checkCode);
 
-    const knownCheckErrors = [
-        "DEVICE_EXPIRED",
-        "DEVICE_UNREGISTERED",
-        "DEVICE_NOT_FOUND"
-    ];
-
-    /*
-     * Nếu API trả success:false nhưng không thuộc
-     * nhóm lỗi thiết bị đã biết thì dừng ngay.
-     *
-     * Không tự động đăng ký lại.
-     */
-
+    // Nếu API trả success:false nhưng không phải lỗi
+    // hết hạn hoặc chưa đăng ký thì dừng ngay.
     if (check.data?.success === false) {
-        if (!knownCheckErrors.includes(checkCode)) {
+        if (!deviceExpired && !deviceNotRegistered) {
             throwWorkerError(
                 check,
                 "API không thể xác minh thiết bị."
@@ -615,11 +589,8 @@ async function ensureDeviceRegistered(signal) {
         }
     }
 
-    /*
-     * Nếu HTTP thất bại nhưng không có mã lỗi
-     * hợp lệ để đăng ký hoặc gia hạn thì dừng.
-     */
-
+    // HTTP thất bại nhưng không có mã lỗi được phép
+    // xử lý thì không tiếp tục.
     if (
         !check.response.ok &&
         !deviceExpired &&
@@ -631,30 +602,12 @@ async function ensureDeviceRegistered(signal) {
         );
     }
 
-    /* ================= BƯỚC 2: RENEW ================= */
+    /* ================= BƯỚC 3: RENEW ================= */
 
-    const checkStatus = String(
-        check.data?.status || ""
-    ).trim().toLowerCase();
-
-    const checkNeedsRenew =
-        check.response.ok &&
-        check.data?.success === true &&
-        [
-            "active",
-            "registered",
-            "valid"
-        ].includes(checkStatus);
-
-    /*
-     * Theo quy trình:
-     * - Thiết bị active/registered/valid: RENEW.
-     * - Thiết bị hết hạn: RENEW.
-     */
-
-    if (deviceExpired || checkNeedsRenew) {
+    // CHỈ gọi /renew khi /check trả DEVICE_EXPIRED.
+    if (deviceExpired) {
         updateDeviceLoadingMessage(
-            "Đang gia hạn xác thực thiết bị..."
+            "Thiết bị đã hết hạn. Đang gia hạn xác thực..."
         );
 
         const renew = await callWorker("/renew");
@@ -678,20 +631,13 @@ async function ensureDeviceRegistered(signal) {
             );
         }
 
-        /*
-         * DEVICE_NOT_EXPIRED:
-         * Không xem là thành công nếu Worker không cấp token.
-         * Trường hợp này cần kiểm tra lại token được trả về.
-         */
-
-        const renewSuccess =
-            renew.response.ok &&
-            renew.data?.success === true;
-
-        if (!renewSuccess) {
+        if (
+            !renew.response.ok ||
+            renew.data?.success !== true
+        ) {
             throwWorkerError(
                 renew,
-                "Không thể gia hạn hoặc xác minh thiết bị."
+                "Không thể gia hạn thiết bị."
             );
         }
 
@@ -709,7 +655,7 @@ async function ensureDeviceRegistered(signal) {
         return finishDeviceAuthentication();
     }
 
-    /* ================= BƯỚC 3: REGISTER ================= */
+    /* ================= BƯỚC 4: REGISTER ================= */
 
     if (deviceNotRegistered) {
         updateDeviceLoadingMessage(
@@ -765,8 +711,18 @@ async function ensureDeviceRegistered(signal) {
         return finishDeviceAuthentication();
     }
 
-    /* ================= BƯỚC 4: LỖI ================= */
+    /* ================= BƯỚC 5: CHECK THÀNH CÔNG ================= */
 
+    // Không gia hạn nếu /check thành công.
+    // Sử dụng deviceToken đang lưu để gọi /list.
+    if (
+        check.response.ok &&
+        check.data?.success === true
+    ) {
+        return finishDeviceAuthentication();
+    }
+
+    // Trường hợp không xác định.
     throwWorkerError(
         check,
         "Không thể xác minh thiết bị. Vui lòng thử lại."
