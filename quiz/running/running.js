@@ -1,4 +1,3 @@
-
 (function () {
     "use strict";
 
@@ -18,13 +17,9 @@
 
         TIMEOUT: 20000,
 
-        // Số lần kết nối lại sau lần thử đầu tiên
         MAX_RETRIES: 3,
-
-        // Thời gian chờ giữa các lần kết nối lại
         RETRY_DELAY: 2000,
 
-        // Thời gian đếm ngược khi thiết bị hết hạn
         EXPIRED_REDIRECT_DELAY: 5000,
 
         DEVICE_ID_KEY: "kho_tai_lieu_device_id_v1",
@@ -326,13 +321,6 @@
 
     /* ====================================================
        GỌI API WORKER VÀ TỰ ĐỘNG KẾT NỐI LẠI
-
-       - Thử lần đầu.
-       - Nếu không phản hồi, thử lại tối đa 3 lần.
-       - Mỗi lần chờ tối đa 20 giây.
-       - Chờ 2 giây giữa các lần thử.
-       - Không thử lại lỗi xác thực thiết bị.
-       - Hiển thị số lần kết nối lại: 1/3, 2/3, 3/3.
     ==================================================== */
 
     async function requestJSON(
@@ -556,9 +544,7 @@
 
             } catch (error) {
 
-                /* ==================================
-                   DỌN DẸP
-                ================================== */
+                /* DỌN DẸP */
 
                 if (timeoutId !== null) {
                     clearTimeout(timeoutId);
@@ -572,9 +558,7 @@
                 }
 
 
-                /* ==================================
-                   HỦY TỪ BÊN NGOÀI
-                ================================== */
+                /* HỦY TỪ BÊN NGOÀI */
 
                 if (
                     options.signal &&
@@ -589,9 +573,7 @@
                 }
 
 
-                /* ==================================
-                   LỖI KHÔNG ĐƯỢC THỬ LẠI
-                ================================== */
+                /* LỖI KHÔNG ĐƯỢC THỬ LẠI */
 
                 if (
                     error?.code === "DEVICE_LOCKED" ||
@@ -608,9 +590,7 @@
                 }
 
 
-                /* ==================================
-                   HẾT LƯỢT THỬ
-                ================================== */
+                /* HẾT LƯỢT THỬ */
 
                 if (attempt >= CONFIG.MAX_RETRIES) {
                     if (timedOut) {
@@ -631,11 +611,7 @@
                 }
 
 
-                /* ==================================
-                   THÔNG BÁO ĐANG KẾT NỐI LẠI
-
-                   SỬA: 1/3 -> 2/3 -> 3/3
-                ================================== */
+                /* THÔNG BÁO ĐANG KẾT NỐI LẠI */
 
                 const nextAttempt = attempt + 1;
 
@@ -671,12 +647,6 @@
 
     /* ====================================================
        BƯỚC 1: KIỂM TRA THIẾT BỊ
-
-       - Chỉ gửi deviceId.
-       - Không gửi deviceToken.
-       - Không tự đăng ký.
-       - Không tự gia hạn.
-       - Chỉ chấp nhận success: true và status: active.
     ==================================================== */
 
     async function checkDevice(
@@ -986,11 +956,12 @@
             code ?? ""
         ).trim();
 
-        if (!/^\d+$/.test(quizCode)) {
-            showStatus(
+        if (!/^\d{8}$/.test(quizCode)) {
+            redirectHomeCountdown(
                 "error",
-                "Mã Quiz không hợp lệ",
-                "Không thể mở phiên Quiz với mã này.",
+                "Kiểm tra không hợp lệ",
+                "Mã Quiz phải gồm đúng 8 chữ số.",
+                5,
                 "!"
             );
 
@@ -1025,38 +996,50 @@
 
 
     /* ====================================================
-       THIẾT BỊ HẾT HẠN
-       ĐẾM NGƯỢC 5 -> 4 -> 3 -> 2 -> 1 -> 0
-       SAU ĐÓ QUAY VỀ TRANG CHỦ
+       ĐẾM NGƯỢC VỀ TRANG CHỦ
     ==================================================== */
 
-    function redirectHomeAfterExpired() {
+    function redirectHomeCountdown(
+        type,
+        title,
+        message,
+        seconds,
+        symbol
+    ) {
         clearCountdown();
         clearRedirectTimer();
 
-        let remaining = 5;
+        let remaining = Math.max(
+            0,
+            Number(seconds) || 0
+        );
 
         const paragraph = showStatus(
-            "error",
-            "Thiết bị đã hết hạn",
-            "Đang chuyển về trang chủ sau " +
+            type || "error",
+            title,
+            message +
+            " Đang trở về trang chủ sau " +
             remaining +
-            " giây...",
-            "!"
+            "s...",
+            symbol || "!"
         );
 
         state.countdownTimer = setInterval(
             function () {
-                remaining--;
+                remaining = Math.max(
+                    0,
+                    remaining - 1
+                );
+
+                if (paragraph) {
+                    paragraph.textContent =
+                        message +
+                        " Đang trở về trang chủ sau " +
+                        remaining +
+                        "s...";
+                }
 
                 if (remaining <= 0) {
-                    remaining = 0;
-
-                    if (paragraph) {
-                        paragraph.textContent =
-                            "Đang chuyển về trang chủ sau 0 giây...";
-                    }
-
                     clearCountdown();
 
                     state.redirectTimer = setTimeout(
@@ -1067,19 +1050,25 @@
                         },
                         300
                     );
-
-                    return;
                 }
-
-                if (paragraph) {
-                    paragraph.textContent =
-                        "Đang chuyển về trang chủ sau " +
-                        remaining +
-                        " giây...";
-                }
-
             },
             1000
+        );
+    }
+
+
+    /* ====================================================
+       THIẾT BỊ HẾT HẠN
+       ĐẾM NGƯỢC 5 -> 0
+    ==================================================== */
+
+    function redirectHomeAfterExpired() {
+        redirectHomeCountdown(
+            "error",
+            "Thiết bị đã hết hạn",
+            "",
+            5,
+            "!"
         );
     }
 
@@ -1089,30 +1078,28 @@
     ==================================================== */
 
     async function checkQuiz() {
-        if (state.loading) {
-            return;
-        }
+        /*
+         * MÃ QUIZ PHẢI CÓ ĐÚNG 8 CHỮ SỐ.
+         * Nếu không hợp lệ thì không gọi bất kỳ API nào.
+         */
 
-        if (
-            !state.code ||
-            !/^\d+$/.test(state.code)
-        ) {
-            showStatus(
+        if (!/^\d{8}$/.test(state.code)) {
+            redirectHomeCountdown(
                 "error",
-                "Mã Quiz không hợp lệ",
-                "Vui lòng kiểm tra lại đường dẫn tham gia Quiz.",
+                "Kiểm tra không hợp lệ",
+                "Mã Quiz phải gồm đúng 8 chữ số.",
+                5,
                 "!"
             );
 
             return;
         }
 
-        state.loading = true;
+        if (state.loading) {
+            return;
+        }
 
-        /*
-         * Ban đầu giữ nguyên deviceLoadingOverlay.
-         * Không gọi showQuizLoading tại đây.
-         */
+        state.loading = true;
 
         const controller = new AbortController();
 
@@ -1158,8 +1145,7 @@
 
 
             /* ==========================================
-               BƯỚC 2: ẨN TẢI THIẾT BỊ
-               HIỆN TẢI QUIZ
+               BƯỚC 2: HIỆN TẢI QUIZ
             ========================================== */
 
             showQuizLoading(
@@ -1224,14 +1210,20 @@
                 responseData?.data ??
                 responseData?.quiz;
 
+            /*
+             * API KHÔNG CÓ DỮ LIỆU QUIZ:
+             * ĐẾM NGƯỢC 10 GIÂY RỒI VỀ TRANG CHỦ.
+             */
+
             if (
                 !quiz ||
                 typeof quiz !== "object"
             ) {
-                showStatus(
+                redirectHomeCountdown(
                     "error",
-                    "API trả về thiếu dữ liệu Quiz",
-                    "Phản hồi không chứa thông tin Quiz hợp lệ.",
+                    "Không tìm thấy Quiz",
+                    "API không có thông tin Quiz tương ứng với mã này.",
+                    10,
                     "!"
                 );
 
@@ -1240,7 +1232,7 @@
 
 
             /* ==========================================
-               KIỂM TRA MÃ QUIZ
+               KIỂM TRA MÃ QUIZ TỪ API
             ========================================== */
 
             const apiCode = String(
@@ -1251,6 +1243,29 @@
                 state.code ?? ""
             ).trim();
 
+
+            /*
+             * API KHÔNG TRẢ VỀ CODE:
+             * ĐẾM NGƯỢC 10 GIÂY RỒI VỀ TRANG CHỦ.
+             */
+
+            if (!apiCode) {
+                redirectHomeCountdown(
+                    "error",
+                    "Không tìm thấy mã Quiz",
+                    "API không trả về mã của Quiz này.",
+                    10,
+                    "!"
+                );
+
+                return;
+            }
+
+
+            /*
+             * CODE API KHÁC CODE TRÊN URL.
+             */
+
             if (apiCode !== pageCode) {
                 showStatus(
                     "error",
@@ -1258,7 +1273,7 @@
                     "Mã trên trang: " +
                     pageCode +
                     ". Mã từ API: " +
-                    (apiCode || "(trống)") +
+                    apiCode +
                     ".",
                     "!"
                 );
