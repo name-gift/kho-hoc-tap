@@ -17,9 +17,13 @@
 
         TIMEOUT: 20000,
 
+        // Số lần kết nối lại sau lần thử đầu tiên
         MAX_RETRIES: 3,
+
+        // Thời gian chờ giữa các lần kết nối lại
         RETRY_DELAY: 2000,
 
+        // Thời gian đếm ngược khi thiết bị hết hạn
         EXPIRED_REDIRECT_DELAY: 5000,
 
         DEVICE_ID_KEY: "kho_tai_lieu_device_id_v1",
@@ -530,13 +534,25 @@
                 /* API SEMANTIC ERROR */
 
                 if (result?.success === false) {
+                    const semanticCode = String(
+                        result?.error ||
+                        result?.code ||
+                        result?.errorCode ||
+                        data?.error ||
+                        data?.code ||
+                        data?.errorCode ||
+                        errorCode ||
+                        "API_ERROR"
+                    ).trim().toUpperCase();
+
                     const error = new Error(
                         result?.message ||
                         data?.message ||
                         "API từ chối yêu cầu."
                     );
 
-                    error.code = errorCode || "API_ERROR";
+                    error.code = semanticCode;
+                    error.apiResponse = result;
                     throw error;
                 }
 
@@ -544,7 +560,9 @@
 
             } catch (error) {
 
-                /* DỌN DẸP */
+                /* ==================================
+                   DỌN DẸP
+                ================================== */
 
                 if (timeoutId !== null) {
                     clearTimeout(timeoutId);
@@ -558,7 +576,9 @@
                 }
 
 
-                /* HỦY TỪ BÊN NGOÀI */
+                /* ==================================
+                   HỦY TỪ BÊN NGOÀI
+                ================================== */
 
                 if (
                     options.signal &&
@@ -573,7 +593,9 @@
                 }
 
 
-                /* LỖI KHÔNG ĐƯỢC THỬ LẠI */
+                /* ==================================
+                   LỖI KHÔNG ĐƯỢC THỬ LẠI
+                ================================== */
 
                 if (
                     error?.code === "DEVICE_LOCKED" ||
@@ -590,7 +612,9 @@
                 }
 
 
-                /* HẾT LƯỢT THỬ */
+                /* ==================================
+                   HẾT LƯỢT THỬ
+                ================================== */
 
                 if (attempt >= CONFIG.MAX_RETRIES) {
                     if (timedOut) {
@@ -611,7 +635,9 @@
                 }
 
 
-                /* THÔNG BÁO ĐANG KẾT NỐI LẠI */
+                /* ==================================
+                   THÔNG BÁO ĐANG KẾT NỐI LẠI
+                ================================== */
 
                 const nextAttempt = attempt + 1;
 
@@ -957,11 +983,10 @@
         ).trim();
 
         if (!/^\d{8}$/.test(quizCode)) {
-            redirectHomeCountdown(
+            showStatus(
                 "error",
-                "Kiểm tra không hợp lệ",
-                "Mã Quiz phải gồm đúng 8 chữ số.",
-                5,
+                "Mã Quiz không hợp lệ",
+                "Không thể mở phiên Quiz với mã này.",
                 "!"
             );
 
@@ -999,47 +1024,70 @@
        ĐẾM NGƯỢC VỀ TRANG CHỦ
     ==================================================== */
 
-    function redirectHomeCountdown(
-        type,
-        title,
-        message,
-        seconds,
-        symbol
-    ) {
+    function redirectHomeCountdown(type, title, message, seconds, symbol) {
         clearCountdown();
         clearRedirectTimer();
 
-        let remaining = Math.max(
-            0,
-            Number(seconds) || 0
-        );
+        let remaining = Math.max(0, Number(seconds) || 0);
 
         const paragraph = showStatus(
             type || "error",
             title,
-            message +
-            " Đang trở về trang chủ sau " +
-            remaining +
-            "s...",
+            message + " Đang trở về trang chủ sau " + remaining + "s...",
             symbol || "!"
+        );
+
+        state.countdownTimer = setInterval(function () {
+            remaining = Math.max(0, remaining - 1);
+
+            if (paragraph) {
+                paragraph.textContent =
+                    message + " Đang trở về trang chủ sau " + remaining + "s...";
+            }
+
+            if (remaining <= 0) {
+                clearCountdown();
+
+                state.redirectTimer = setTimeout(function () {
+                    window.location.replace(CONFIG.HOME_URL);
+                }, 300);
+            }
+        }, 1000);
+    }
+
+
+    /* ====================================================
+       THIẾT BỊ HẾT HẠN
+       ĐẾM NGƯỢC 5 -> 4 -> 3 -> 2 -> 1 -> 0
+    ==================================================== */
+
+    function redirectHomeAfterExpired() {
+        clearCountdown();
+        clearRedirectTimer();
+
+        let remaining = 5;
+
+        const paragraph = showStatus(
+            "error",
+            "Thiết bị đã hết hạn",
+            "Đang chuyển về trang chủ sau " +
+            remaining +
+            " giây...",
+            "!"
         );
 
         state.countdownTimer = setInterval(
             function () {
-                remaining = Math.max(
-                    0,
-                    remaining - 1
-                );
-
-                if (paragraph) {
-                    paragraph.textContent =
-                        message +
-                        " Đang trở về trang chủ sau " +
-                        remaining +
-                        "s...";
-                }
+                remaining--;
 
                 if (remaining <= 0) {
+                    remaining = 0;
+
+                    if (paragraph) {
+                        paragraph.textContent =
+                            "Đang chuyển về trang chủ sau 0 giây...";
+                    }
+
                     clearCountdown();
 
                     state.redirectTimer = setTimeout(
@@ -1050,25 +1098,19 @@
                         },
                         300
                     );
+
+                    return;
                 }
+
+                if (paragraph) {
+                    paragraph.textContent =
+                        "Đang chuyển về trang chủ sau " +
+                        remaining +
+                        " giây...";
+                }
+
             },
             1000
-        );
-    }
-
-
-    /* ====================================================
-       THIẾT BỊ HẾT HẠN
-       ĐẾM NGƯỢC 5 -> 0
-    ==================================================== */
-
-    function redirectHomeAfterExpired() {
-        redirectHomeCountdown(
-            "error",
-            "Thiết bị đã hết hạn",
-            "",
-            5,
-            "!"
         );
     }
 
@@ -1078,16 +1120,14 @@
     ==================================================== */
 
     async function checkQuiz() {
-        /*
-         * MÃ QUIZ PHẢI CÓ ĐÚNG 8 CHỮ SỐ.
-         * Nếu không hợp lệ thì không gọi bất kỳ API nào.
-         */
+        // Mã Quiz phải gồm đúng 8 chữ số.
+        // Nếu sai, không gọi API.
 
         if (!/^\d{8}$/.test(state.code)) {
             redirectHomeCountdown(
                 "error",
                 "Kiểm tra không hợp lệ",
-                "Mã Quiz phải gồm đúng 8 chữ số.",
+                "Mã Quiz không hợp lệ.",
                 5,
                 "!"
             );
@@ -1095,11 +1135,12 @@
             return;
         }
 
-        if (state.loading) {
-            return;
-        }
-
         state.loading = true;
+
+        /*
+         * Ban đầu giữ nguyên deviceLoadingOverlay.
+         * Không gọi showQuizLoading tại đây.
+         */
 
         const controller = new AbortController();
 
@@ -1145,7 +1186,8 @@
 
 
             /* ==========================================
-               BƯỚC 2: HIỆN TẢI QUIZ
+               BƯỚC 2: ẨN TẢI THIẾT BỊ
+               HIỆN TẢI QUIZ
             ========================================== */
 
             showQuizLoading(
@@ -1210,11 +1252,6 @@
                 responseData?.data ??
                 responseData?.quiz;
 
-            /*
-             * API KHÔNG CÓ DỮ LIỆU QUIZ:
-             * ĐẾM NGƯỢC 10 GIÂY RỒI VỀ TRANG CHỦ.
-             */
-
             if (
                 !quiz ||
                 typeof quiz !== "object"
@@ -1232,7 +1269,7 @@
 
 
             /* ==========================================
-               KIỂM TRA MÃ QUIZ TỪ API
+               KIỂM TRA MÃ QUIZ
             ========================================== */
 
             const apiCode = String(
@@ -1242,12 +1279,6 @@
             const pageCode = String(
                 state.code ?? ""
             ).trim();
-
-
-            /*
-             * API KHÔNG TRẢ VỀ CODE:
-             * ĐẾM NGƯỢC 10 GIÂY RỒI VỀ TRANG CHỦ.
-             */
 
             if (!apiCode) {
                 redirectHomeCountdown(
@@ -1260,11 +1291,6 @@
 
                 return;
             }
-
-
-            /*
-             * CODE API KHÁC CODE TRÊN URL.
-             */
 
             if (apiCode !== pageCode) {
                 showStatus(
@@ -1377,6 +1403,30 @@
 
 
         } catch (error) {
+
+            /* ==========================================
+               QUIZ NOT FOUND
+               API: success:false, error/code: QUIZ_NOT_FOUND
+               ĐẾM NGƯỢC 10 -> 9 -> ... -> 0
+            ========================================== */
+
+            if (
+                error?.code === "QUIZ_NOT_FOUND" ||
+                error?.message === "QUIZ_NOT_FOUND"
+            ) {
+                redirectHomeCountdown(
+                    "error",
+                    "Không tìm thấy bài Quiz",
+                    error?.message && error.message !== "QUIZ_NOT_FOUND"
+                        ? error.message
+                        : "Không tìm thấy bài quiz.",
+                    10,
+                    "!"
+                );
+
+                return;
+            }
+
 
             /* ==========================================
                API TIMEOUT / KHÔNG KẾT NỐI ĐƯỢC
